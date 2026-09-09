@@ -64,7 +64,7 @@ def ulaw_to_pcm(ulaw_data: bytes) -> bytes:
 
 def pcm_to_ulaw(pcm_data: bytes) -> bytes:
     """Кодирует PCM 16-bit в μ-law (G.711)."""
-    import audioop  # type: ignore[import-not-found]
+    import audioop
     return audioop.lin2ulaw(pcm_data, 2)
 
 

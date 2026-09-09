@@ -23,6 +23,7 @@ dependencies = [
     "anthropic>=0.39.0",
     "openai>=1.55.0",
     "faster-whisper>=1.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +49,13 @@ packages = ["src/phoneagent"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# ponytail: DTZ (naive datetime.now()) и PYI034/036 (Self/exit-annotation stubs)
+# — pre-existing paттерн по всему проекту (ConversationState/Message timestamps),
+# не связаны с багами этого прохода. Апгрейд — отдельный проход на tz-aware
+# datetime везде разом, а не точечно в паре файлов.
+ignore = ["DTZ001", "DTZ005", "PYI034", "PYI036"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

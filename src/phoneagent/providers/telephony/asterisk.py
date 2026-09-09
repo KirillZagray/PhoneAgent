@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from phoneagent.models.call import CallEvent, CallRef, CallStatus, CallStatusEnum
+from phoneagent.models.call import CallEvent, CallRef, CallStatus
 from phoneagent.providers.telephony.base import BaseTelephonyProvider
 from phoneagent.utils import get_logger
 
@@ -49,6 +49,7 @@ class AsteriskTelephonyProvider(BaseTelephonyProvider):
         # WebSocket /ari/events
         msg = "Asterisk: WebSocket /ari/events"
         raise NotImplementedError(msg)
+        yield  # делает функцию async generator, не coroutine
 
     async def send_audio(self, call_id: str, audio: AsyncIterator[bytes]) -> None:
         # ExternalMedia + AudioSocket

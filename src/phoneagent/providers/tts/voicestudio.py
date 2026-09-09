@@ -1,10 +1,13 @@
 """VoiceStudio TTS — локальный open-source клон ElevenLabs.
 
-Интеграция с https://github.com/debpalash/VoiceStudio через его HTTP API.
-
-VoiceStudio имеет endpoint:
+Интеграция с https://github.com/debpalash/VoiceStudio через его OpenAI-совместимый
+HTTP API (по умолчанию слушает http://localhost:3900):
 - POST /v1/audio/speech — синтез речи
-- GET /v1/voices — список голосов
+- GET  /v1/audio/voices — список голосов
+
+STT (распознавание) того же сервера — см. `providers/stt/voicestudio.py`
+(VoiceStudio запускает Whisper-семейство ASR — WhisperX/faster-whisper — под
+капотом и отдаёт его через тот же OpenAI-совместимый API).
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ class VoiceStudioTTSProvider(BaseTTSProvider):
         )
         # Проверяем доступность
         try:
-            response = await self._client.get("/v1/voices", timeout=5.0)
+            response = await self._client.get("/v1/audio/voices", timeout=5.0)
             response.raise_for_status()
             logger.info("voicestudio_connected", url=str(self.settings.voicestudio_url))
         except httpx.HTTPError as e:
@@ -65,6 +68,7 @@ class VoiceStudioTTSProvider(BaseTTSProvider):
         response = await self._client.post(
             "/v1/audio/speech",
             json={
+                "model": "tts-1",
                 "input": text,
                 "voice": voice_id,
                 "language": language,
@@ -93,6 +97,7 @@ class VoiceStudioTTSProvider(BaseTTSProvider):
             "POST",
             "/v1/audio/speech",
             json={
+                "model": "tts-1",
                 "input": text,
                 "voice": voice_id,
                 "language": language,

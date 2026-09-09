@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field, HttpUrl, RedisDsn
@@ -30,6 +31,7 @@ class STTProvider(StrEnum):
     MOCK = "mock"
     WHISPER_API = "whisper_api"
     FASTER_WHISPER = "faster_whisper"
+    VOICESTUDIO = "voicestudio"
 
 
 class TTSProvider(StrEnum):
@@ -68,7 +70,9 @@ class PhoneAgentSettings(BaseSettings):
     app_port: int = 8000
     app_name: str = "PhoneAgent"
 
-    # ── Redis ───────────────────────────────────────────
+    # ── State store ───────────────────────────────────────
+    # "redis" (прод) или "memory" (dev/тесты без поднятого Redis).
+    state_store: Literal["redis", "memory"] = "redis"
     redis_url: RedisDsn = Field(default="redis://localhost:6379/0")  # type: ignore[assignment]
 
     # ── Telephony ───────────────────────────────────────
@@ -97,7 +101,10 @@ class PhoneAgentSettings(BaseSettings):
 
     # ── TTS ─────────────────────────────────────────────
     tts_provider: TTSProvider = TTSProvider.MOCK
-    voicestudio_url: HttpUrl = Field(default="http://localhost:8000")  # type: ignore[assignment]
+    # VoiceStudio (https://github.com/debpalash/VoiceStudio) — общий сервер и для
+    # tts_provider=voicestudio, и для stt_provider=voicestudio. Дефолтный порт из
+    # его докер-образа — 3900.
+    voicestudio_url: HttpUrl = Field(default="http://localhost:3900")  # type: ignore[assignment]
     voicestudio_voice_id: str = "ru_female_01"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
@@ -124,7 +131,14 @@ class PhoneAgentSettings(BaseSettings):
     call_timeout_seconds: int = 300
     max_retries: int = 3
 
+    # ── Security ──────────────────────────────────────────
+    # Bearer-токен для /call/*. Пусто = эндпоинт открыт (только для локальной разработки).
+    api_auth_token: str = ""
+    # Общий секрет для входящих /webhooks/*. Пусто = проверка отключена (dev).
+    webhook_secret: str = ""
 
+
+@lru_cache
 def get_settings() -> PhoneAgentSettings:
-    """Возвращает singleton настроек (для удобства импорта)."""
+    """Возвращает singleton настроек (кешируется на процесс)."""
     return PhoneAgentSettings()

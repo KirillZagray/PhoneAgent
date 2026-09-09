@@ -61,7 +61,7 @@ class BaseSTTProvider(ABC):
         """
         ...
 
-    async def __aenter__(self) -> "BaseSTTProvider":
+    async def __aenter__(self) -> BaseSTTProvider:
         await self.connect()
         return self
 

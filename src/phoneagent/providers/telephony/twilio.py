@@ -98,7 +98,7 @@ class TwilioTelephonyProvider(BaseTelephonyProvider):
     async def events(self) -> AsyncIterator[CallEvent]:
         # События приходят через webhooks
         while False:
-            yield  # type: ignore[unreachable]
+            yield
 
     async def send_audio(self, call_id: str, audio: AsyncIterator[bytes]) -> None:
         # Twilio использует <Stream> TwiML для bidirectional audio

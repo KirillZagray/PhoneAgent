@@ -61,6 +61,10 @@ def build_stt_provider(settings: PhoneAgentSettings | None = None) -> BaseSTTPro
         from phoneagent.providers.stt.whisper import FasterWhisperProvider
         return FasterWhisperProvider()
 
+    if provider.value == "voicestudio":
+        from phoneagent.providers.stt.voicestudio import VoiceStudioSTTProvider
+        return VoiceStudioSTTProvider()
+
     msg = f"Unknown STT provider: {provider}"
     raise ValueError(msg)
 

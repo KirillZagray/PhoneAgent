@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
+from phoneagent.api.security import require_webhook_secret
 from phoneagent.utils import get_logger
 
-router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+router = APIRouter(prefix="/webhooks", tags=["webhooks"], dependencies=[Depends(require_webhook_secret)])
 logger = get_logger(__name__)
 
 

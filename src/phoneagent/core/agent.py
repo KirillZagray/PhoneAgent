@@ -1,21 +1,33 @@
 """LLM-агент с tool calling.
 
 Поддерживает Anthropic и OpenAI. Mock-провайдер для тестов.
+
+Tool-calling раунды (LLM просит tool -> мы выполняем -> отдаём результат
+обратно LLM -> LLM отвечает текстом) полностью происходят *внутри* одного
+`run_turn()`. Наружу (в ConversationState.messages) попадает только
+финальный текст пользователя/ассистента — так и Anthropic, и OpenAI получают
+на следующий turn корректную историю без "полу-собранных" tool_use блоков.
 """
 
 from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from phoneagent.config import get_settings
 from phoneagent.core.prompts import get_system_prompt
-from phoneagent.models.booking import Master, Service, Slot
-from phoneagent.models.conversation import ConversationState, Message, Role
+from phoneagent.models.conversation import ConversationState, Role
 from phoneagent.utils import get_logger
 
 logger = get_logger(__name__)
+
+# Максимум раундов "LLM просит tool -> получает результат" за один turn.
+# Защита от зацикливания, если модель никак не остановится.
+MAX_TOOL_ROUNDS = 5
+
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 
 class ToolCall:
@@ -28,7 +40,7 @@ class ToolCall:
 
 
 class AgentResponse:
-    """Ответ LLM-агента."""
+    """Ответ LLM-агента (уже после разрешения всех tool calls этого turn'а)."""
 
     def __init__(
         self,
@@ -61,9 +73,26 @@ class BaseLLMAgent(ABC):
         state: ConversationState,
         user_message: str,
         tools: list[dict[str, Any]],
+        *,
+        execute_tool: ToolExecutor | None = None,
     ) -> AgentResponse:
-        """Один turn диалога: пользователь говорит → агент отвечает + tool calls."""
+        """Один turn диалога: пользователь говорит → агент отвечает + tool calls.
+
+        Если модель запрашивает tool, реализация вызывает `execute_tool(name, arguments)`
+        и продолжает цикл сама — наружу возвращается уже финальный ответ.
+        """
         ...
+
+    def _text_history(self, state: ConversationState) -> list[dict[str, str]]:
+        """История для API: только законченные user/assistant реплики.
+
+        Tool-раунды не реплеим — они уже разрешены внутри своего turn'а.
+        """
+        return [
+            {"role": m.role.value, "content": m.content}
+            for m in state.messages
+            if m.role in (Role.USER, Role.ASSISTANT)
+        ]
 
 
 # ── Tool descriptions (передаются в LLM) ──────────────────────
@@ -146,6 +175,8 @@ class MockLLMAgent(BaseLLMAgent):
         state: ConversationState,
         user_message: str,
         tools: list[dict[str, Any]],
+        *,
+        execute_tool: ToolExecutor | None = None,
     ) -> AgentResponse:
         text_lower = user_message.lower()
 
@@ -209,54 +240,67 @@ class AnthropicLLMAgent(BaseLLMAgent):
         state: ConversationState,
         user_message: str,
         tools: list[dict[str, Any]],
+        *,
+        execute_tool: ToolExecutor | None = None,
     ) -> AgentResponse:
         if self._client is None:
             msg = "Anthropic client not connected"
             raise RuntimeError(msg)
 
-        # Формируем messages из state.messages + user_message
-        messages = [{"role": m.role.value if m.role != Role.TOOL else "user", "content": m.content}
-                    for m in state.messages]
-        messages.append({"role": "user", "content": user_message})
-
-        # Tools: конвертируем в формат Anthropic
         anthropic_tools = [
-            {
-                "name": t["name"],
-                "description": t["description"],
-                "input_schema": t["input_schema"],
-            }
+            {"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
             for t in tools
         ]
 
-        response = await self._client.messages.create(
-            model=self.settings.anthropic_model,
-            max_tokens=512,
-            system=get_system_prompt(state.language),
-            tools=anthropic_tools,
-            messages=messages,
-        )
+        messages: list[dict[str, Any]] = self._text_history(state)
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
 
-        # Извлекаем текст и tool calls
+        executed_tool_calls: list[ToolCall] = []
         text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
+        stop_reason = ""
 
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        name=block.name,
-                        arguments=block.input,
-                        call_id=block.id,
-                    )
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await self._client.messages.create(
+                model=self.settings.anthropic_model,
+                max_tokens=512,
+                system=get_system_prompt(state.language),
+                tools=anthropic_tools,
+                messages=messages,
+            )
+            stop_reason = response.stop_reason
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            text_parts.extend(b.text for b in response.content if b.type == "text")
+
+            if not tool_uses:
+                break
+
+            # Ассистентский ход с tool_use блоками уходит в историю как есть.
+            messages.append({"role": "assistant", "content": response.content})
+
+            tool_result_blocks: list[dict[str, Any]] = []
+            for block in tool_uses:
+                call = ToolCall(name=block.name, arguments=block.input, call_id=block.id)
+                executed_tool_calls.append(call)
+                if execute_tool is None:
+                    result: Any = {"error": "no tool executor configured"}
+                else:
+                    result = await execute_tool(call.name, call.arguments)
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result, default=str, ensure_ascii=False),
+                    }
                 )
+            messages.append({"role": "user", "content": tool_result_blocks})
+        else:
+            logger.warning("anthropic_tool_round_limit_reached", call_id=state.call_id)
 
         return AgentResponse(
-            text=" ".join(text_parts),
-            tool_calls=tool_calls,
-            is_final=response.stop_reason == "end_turn",
+            text=" ".join(p for p in text_parts if p),
+            tool_calls=executed_tool_calls,
+            is_final=stop_reason == "end_turn",
         )
 
 
@@ -289,12 +333,13 @@ class OpenAILLMAgent(BaseLLMAgent):
         state: ConversationState,
         user_message: str,
         tools: list[dict[str, Any]],
+        *,
+        execute_tool: ToolExecutor | None = None,
     ) -> AgentResponse:
         if self._client is None:
             msg = "OpenAI client not connected"
             raise RuntimeError(msg)
 
-        # OpenAI формат tools
         openai_tools = [
             {
                 "type": "function",
@@ -307,33 +352,62 @@ class OpenAILLMAgent(BaseLLMAgent):
             for t in tools
         ]
 
-        messages = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": get_system_prompt(state.language)},
-            *[{"role": m.role.value if m.role != Role.TOOL else "tool", "content": m.content}
-              for m in state.messages],
-            {"role": "user", "content": user_message},
+            *self._text_history(state),
         ]
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
 
-        response = await self._client.chat.completions.create(
-            model=self.settings.openai_model,
-            messages=messages,
-            tools=openai_tools,
-            max_tokens=512,
-        )
+        executed_tool_calls: list[ToolCall] = []
+        text = ""
 
-        msg_response = response.choices[0].message
-        text = msg_response.content or ""
-        tool_calls: list[ToolCall] = []
-        if msg_response.tool_calls:
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await self._client.chat.completions.create(
+                model=self.settings.openai_model,
+                messages=messages,
+                tools=openai_tools,
+                max_tokens=512,
+            )
+            msg_response = response.choices[0].message
+            text = msg_response.content or ""
+
+            if not msg_response.tool_calls:
+                break
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": msg_response.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in msg_response.tool_calls
+                    ],
+                }
+            )
             for tc in msg_response.tool_calls:
-                tool_calls.append(
-                    ToolCall(
-                        name=tc.function.name,
-                        arguments=json.loads(tc.function.arguments),
-                        call_id=tc.id,
-                    )
+                arguments = json.loads(tc.function.arguments)
+                call = ToolCall(name=tc.function.name, arguments=arguments, call_id=tc.id)
+                executed_tool_calls.append(call)
+                if execute_tool is None:
+                    result: Any = {"error": "no tool executor configured"}
+                else:
+                    result = await execute_tool(call.name, call.arguments)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, default=str, ensure_ascii=False),
+                    }
                 )
-        return AgentResponse(text=text, tool_calls=tool_calls)
+        else:
+            logger.warning("openai_tool_round_limit_reached", call_id=state.call_id)
+
+        return AgentResponse(text=text, tool_calls=executed_tool_calls, is_final=True)
 
 
 # ── Factory ─────────────────────────────────────────────
@@ -359,8 +433,9 @@ def build_llm_agent() -> BaseLLMAgent:
 
 
 __all__ = [
+    "TOOL_DESCRIPTIONS",
     "AgentResponse",
     "BaseLLMAgent",
-    "TOOL_DESCRIPTIONS",
+    "ToolExecutor",
     "build_llm_agent",
 ]

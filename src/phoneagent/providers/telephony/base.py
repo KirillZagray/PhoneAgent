@@ -23,6 +23,12 @@ class BaseTelephonyProvider(ABC):
 
     name: str = "base"
 
+    #: True только когда send_audio/send_text реально реализованы и звонок можно
+    #: провести целиком. Провайдеры-заготовки (Twilio/Voximplant/Asterisk сейчас)
+    #: держат False, чтобы Orchestrator не набирал реальный номер и не ронял звонок
+    #: сразу после соединения (см. roadmap в README).
+    supports_realtime_audio: bool = False
+
     @abstractmethod
     async def connect(self) -> None:
         """Инициализация клиента провайдера (HTTP-сессии, авторизация)."""
@@ -76,7 +82,7 @@ class BaseTelephonyProvider(ABC):
         """Отправляет текст в звонок (для провайдеров с встроенным TTS)."""
         ...
 
-    async def __aenter__(self) -> "BaseTelephonyProvider":
+    async def __aenter__(self) -> BaseTelephonyProvider:
         await self.connect()
         return self
 

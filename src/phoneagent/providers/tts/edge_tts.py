@@ -10,10 +10,10 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from phoneagent.providers.tts.base import BaseTTSProvider
 from phoneagent.utils import get_logger
-from phoneagent.utils.audio import wav_to_pcm
 
 logger = get_logger(__name__)
 
@@ -58,7 +58,7 @@ class EdgeTTSProvider(BaseTTSProvider):
         if not self._available:
             msg = "edge-tts not installed"
             raise RuntimeError(msg)
-        import edge_tts  # type: ignore[import-not-found]
+        import edge_tts
 
         voice_name = voice or self.default_voice
         communicate = edge_tts.Communicate(text, voice=voice_name)
@@ -68,8 +68,7 @@ class EdgeTTSProvider(BaseTTSProvider):
 
         try:
             await communicate.save(tmp_path)
-            with open(tmp_path, "rb") as f:
-                mp3_data = f.read()
+            mp3_data = await asyncio.to_thread(Path(tmp_path).read_bytes)
             # Конвертируем MP3 → WAV → PCM
             pcm = await asyncio.to_thread(self._mp3_to_pcm, mp3_data, sample_rate)
             return pcm
@@ -83,11 +82,13 @@ class EdgeTTSProvider(BaseTTSProvider):
     def _mp3_to_pcm(self, mp3_data: bytes, sample_rate: int) -> bytes:
         """Конвертирует MP3 в сырой PCM 16-bit через pydub (или ffmpeg)."""
         try:
-            from pydub import AudioSegment  # type: ignore[import-not-found]
             from io import BytesIO
+
+            from pydub import AudioSegment  # type: ignore
+
             audio = AudioSegment.from_mp3(BytesIO(mp3_data))
             audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
-            return audio.raw_data
+            return bytes(audio.raw_data)
         except ImportError:
             logger.warning("pydub_not_available_returning_wav")
             # Fallback: возвращаем MP3 как есть (провайдер не сможет играть без конвертации)

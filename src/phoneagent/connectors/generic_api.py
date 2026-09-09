@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-import json
 from datetime import date
 from typing import Any
 
 import httpx
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from phoneagent.config import get_settings
 from phoneagent.connectors.base import BaseBookingConnector
@@ -78,6 +78,23 @@ class GenericAPIBookingConnector(BaseBookingConnector):
         if self._client:
             await self._client.aclose()
 
+    def _fill_template(self, template: Any, params: dict[str, Any]) -> Any:
+        """Подставляет `{param}` из params в шаблон body (рекурсивно, dict/list/str).
+
+        `"{master_id}"` как значение целиком заменяется на сам объект params["master_id"]
+        (без приведения к строке), внутри более длинной строки — через str.format.
+        """
+        if isinstance(template, str):
+            if template.startswith("{") and template.endswith("}") and template[1:-1] in params:
+                return params[template[1:-1]]
+            safe = {k: v for k, v in params.items() if v is not None}
+            return template.format(**safe)
+        if isinstance(template, dict):
+            return {k: self._fill_template(v, params) for k, v in template.items()}
+        if isinstance(template, list):
+            return [self._fill_template(v, params) for v in template]
+        return template
+
     def _extract(self, data: dict[str, Any] | list[Any], path: str) -> Any:
         """Извлекает данные по dot-нотации."""
         if not path:
@@ -97,7 +114,17 @@ class GenericAPIBookingConnector(BaseBookingConnector):
                 return None
         return current
 
+    @retry(
+        retry=retry_if_exception_type(httpx.ConnectError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, max=4),
+        reraise=True,
+    )
     async def _call(self, endpoint_name: str, **params: Any) -> Any:
+        # Ретраим только ConnectError (соединение не установилось — запрос точно
+        # не дошёл до сервера салона). Таймауты/5xx после отправки НЕ ретраим:
+        # для create_booking повторная отправка при неясном исходе может
+        # задвоить запись.
         if self._client is None:
             msg = "Connector not connected"
             raise RuntimeError(msg)
@@ -107,9 +134,12 @@ class GenericAPIBookingConnector(BaseBookingConnector):
         response_path = cfg.get("response_path", "")
 
         # Подставляем параметры в path/query/body
-        formatted_path = path.format(**params)
-        query = {k: v for k, v in params.items() if k not in ("method", "path")}
-        body = cfg.get("body", {})
+        safe_params = {k: v for k, v in params.items() if v is not None}
+        formatted_path = path.format(**safe_params)
+        query = {k: v for k, v in safe_params.items() if k not in ("method", "path")}
+        body_template = cfg.get("body")
+        # Без явного шаблона body в конфиге — шлём все переданные параметры как есть.
+        body = self._fill_template(body_template, params) if body_template is not None else safe_params
 
         if method == "GET":
             response = await self._client.get(formatted_path, params=query)
@@ -196,7 +226,7 @@ class GenericAPIBookingConnector(BaseBookingConnector):
             client_name=request.client_name,
         )
         # Парсим ответ от API салона
-        booking_id = str(raw.get("id", ""))
+        booking_id = str(raw.get("id", "")) if isinstance(raw, dict) else ""
         return Booking(
             id=booking_id,
             salon_id=self.settings.salon_id,
@@ -220,10 +250,10 @@ class GenericAPIBookingConnector(BaseBookingConnector):
 
 def build_generic_connector_from_yaml(yaml_path: str) -> GenericAPIBookingConnector:
     """Загружает конфиг эндпоинтов из YAML и создаёт коннектор."""
-    import yaml  # type: ignore[import-not-found]
+    import yaml  # type: ignore
     with open(yaml_path) as f:
         config = yaml.safe_load(f)
     return GenericAPIBookingConnector(config=config)
 
 
-__all__ = ["GenericAPIBookingConnector", "build_generic_connector_from_yaml", "ServiceCategory"]
+__all__ = ["GenericAPIBookingConnector", "ServiceCategory", "build_generic_connector_from_yaml"]

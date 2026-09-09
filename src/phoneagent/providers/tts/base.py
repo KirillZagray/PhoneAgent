@@ -51,7 +51,7 @@ class BaseTTSProvider(ABC):
         """
         ...
 
-    async def __aenter__(self) -> "BaseTTSProvider":
+    async def __aenter__(self) -> BaseTTSProvider:
         await self.connect()
         return self
 

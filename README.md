@@ -36,6 +36,12 @@
                                          └──────────────────┘
 ```
 
+**VoiceStudio** ([debpalash/VoiceStudio](https://github.com/debpalash/VoiceStudio)) — один локальный
+сервер и для TTS, и для STT: OpenAI-совместимый API (`POST /v1/audio/speech` для синтеза,
+`POST /v1/audio/transcriptions` для распознавания — под капотом Whisper-семейство ASR,
+WhisperX/faster-whisper). Достаточно поднять один контейнер и выставить `TTS_PROVIDER=voicestudio`
++ `STT_PROVIDER=voicestudio` с общим `VOICESTUDIO_URL` — отдельный Whisper-провайдер не нужен.
+
 ## 🎯 Ключевая идея — провайдеры подключаются через единый интерфейс
 
 ```python
@@ -81,17 +87,25 @@ cp .env.example .env
 # отредактировать .env под свои провайдеры
 ```
 
-### 2. Запустить с моками (без реальных звонков)
+### 2. Запустить с моками (без реальных звонков, без Redis)
+
+По умолчанию `.env.example` уже настроен на моки и `STATE_STORE=memory` — реальные
+звонки, Redis, LLM/telephony-ключи для этого шага не нужны.
 
 ```bash
 uv run python -m phoneagent.main
-# в другом терминале:
-curl -X POST http://localhost:8000/call/request-callback \
-  -H "Content-Type: application/json" \
-  -d '{"phone":"+79991234567","salon_id":"demo"}'
+# в другом терминале — текстовый диалог с FSM (тот же путь, что и голосовой звонок,
+# только без telephony/STT/TTS):
+curl -X POST http://localhost:8000/call/text -H "Content-Type: application/json" \
+  -d '{"text":"Здравствуйте"}'
+# ответ содержит call_id — передавайте его дальше, чтобы продолжить тот же диалог:
+curl -X POST http://localhost:8000/call/text -H "Content-Type: application/json" \
+  -d '{"text":"Хочу стрижку","call_id":"<call_id из прошлого ответа>"}'
 ```
 
-Откроется WebSocket консоль, где можно ввести текстом что «говорит клиент» и услышать/увидеть ответы ассистента.
+`POST /call/request-callback` (реальный дозвон) намеренно откажет с 400, пока
+`TELEPHONY_PROVIDER` не `mock` — реалтайм-аудио стриминг для Voximplant/Twilio/Asterisk
+ещё не реализован (см. Roadmap), и звонок с ними просто дозвонится и сразу оборвётся.
 
 ### 3. Подключить реальные провайдеры
 
@@ -126,52 +140,51 @@ phoneagent/
 │   ├── main.py                  # FastAPI app
 │   ├── config.py                # Pydantic Settings
 │   ├── api/
-│   │   ├── trigger.py           # POST /call/request-callback
+│   │   ├── trigger.py           # POST /call/request-callback, /call/text
 │   │   ├── webhooks.py          # POST /webhooks/{provider}
-│   │   └── admin.py             # GET /calls, /health, /config
+│   │   ├── admin.py             # GET /admin/health, /config, /version
+│   │   └── security.py          # Bearer-токен / webhook-secret зависимости
 │   ├── core/
 │   │   ├── orchestrator.py      # Главный цикл: STT→LLM→TTS→Telephony
-│   │   ├── conversation.py      # FSM (greeting→service→date→time→master→confirm)
-│   │   ├── agent.py             # LLM agent с tool calling
+│   │   ├── agent.py             # LLM agent с tool calling (Anthropic/OpenAI/mock)
+│   │   ├── state_store.py       # Redis / in-memory хранилище состояний
 │   │   └── prompts.py           # System prompts (multi-language)
 │   ├── providers/
 │   │   ├── telephony/
-│   │   │   ├── base.py          # ABC
-│   │   │   ├── mock.py          # для dev (текстовая консоль)
-│   │   │   ├── voximplant.py    # РФ
-│   │   │   ├── twilio.py
-│   │   │   └── asterisk.py      # self-hosted
+│   │   │   ├── base.py          # ABC (+ supports_realtime_audio флаг)
+│   │   │   ├── mock.py          # для dev (единственный полностью рабочий)
+│   │   │   ├── voximplant.py    # РФ — заготовка, без send_audio
+│   │   │   ├── twilio.py        # заготовка, без send_audio
+│   │   │   └── asterisk.py      # self-hosted — заготовка
 │   │   ├── stt/
 │   │   │   ├── base.py
-│   │   │   ├── whisper_api.py
-│   │   │   └── faster_whisper.py
+│   │   │   ├── mock.py
+│   │   │   ├── whisper.py       # WhisperAPIProvider (OpenAI) + FasterWhisperProvider (локально)
+│   │   │   └── voicestudio.py   # тот же сервер, что и tts/voicestudio.py
 │   │   └── tts/
 │   │       ├── base.py
+│   │       ├── mock.py
 │   │       ├── edge_tts.py      # бесплатный
 │   │       ├── voicestudio.py
 │   │       └── elevenlabs.py
 │   ├── connectors/
 │   │   ├── base.py
+│   │   ├── mock.py
 │   │   ├── generic_api.py       # универсальный REST клиент
-│   │   ├── yclients.py
-│   │   ├── dikidi.py
-│   │   └── altegio.py
+│   │   └── factory.py           # yclients/dikidi/altegio пока raise NotImplementedError
 │   ├── models/
 │   │   ├── call.py
 │   │   ├── booking.py
 │   │   └── conversation.py
 │   └── utils/
 │       ├── audio.py
-│       └── logging.py
+│       └── __init__.py          # логирование (structlog) тут же
 ├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
 ├── examples/
 │   ├── voximplant_setup.md
-│   ├── twilio_setup.md
 │   ├── voicestudio_setup.md
-│   └── salon_openapi.yaml       # пример ТЗ для интеграции с системой салона
+│   └── salon_openapi.md         # пример ТЗ для интеграции с системой салона
+├── .github/workflows/ci.yml     # ruff + mypy + pytest
 ├── docker-compose.yml
 ├── pyproject.toml
 └── README.md
@@ -179,9 +192,10 @@ phoneagent/
 
 ## 🔧 Интеграция с системой записи салона
 
-Самый простой способ — `GenericAPIConnector` + OpenAPI-спека вашей системы. Если у салона **YClients, Dikidi или Altegio** — есть готовые адаптеры.
+Самый простой способ — `GenericAPIConnector` + OpenAPI-спека вашей системы. Адаптеры для
+**YClients, Dikidi, Altegio** — в планах (см. Roadmap), пока не реализованы.
 
-Пример ТЗ для салона в `examples/salon_openapi.yaml`:
+Пример ТЗ для салона в `examples/salon_openapi.md`:
 
 ```yaml
 endpoints:
@@ -191,19 +205,43 @@ endpoints:
   create_booking: POST /bookings
 ```
 
+## 🔒 Безопасность
+
+`/call/*` и `/webhooks/*` без настройки открыты всем — годится только для локальной
+разработки. Перед деплоем задайте в `.env`:
+
+- `API_AUTH_TOKEN` — сайт салона шлёт его как `Authorization: Bearer <token>`
+  в `/call/request-callback` и `/call/text`.
+- `WEBHOOK_SECRET` — провайдер (или ваш прокси перед ним) должен слать заголовок
+  `X-Webhook-Secret` с этим значением на `/webhooks/*`.
+
+Это общий shared-secret, а не честная per-provider проверка подписи (Twilio своя
+HMAC-схема, у Voximplant/Asterisk — своя). Апгрейд на нативную проверку подписи —
+следующий шаг, когда появится реальная интеграция с конкретным провайдером.
+
+`/docs` и `/redoc` (Swagger) отключены везде, кроме `APP_ENV=development`.
+
 ## 🛣 Roadmap
 
 | # | Этап | Статус |
 |---|------|--------|
 | 1 | Скелет + mock-провайдеры + FSM | ✅ |
 | 2 | Voximplant + WebSocket-стриминг | ⏳ |
-| 3 | Edge TTS + VoiceStudio провайдеры | ⏳ |
-| 4 | Whisper STT (API + local) | ⏳ |
-| 5 | LLM agent с tool use (Anthropic) | ✅ |
+| 3 | Edge TTS + VoiceStudio провайдеры (TTS) | ✅ |
+| 3b | VoiceStudio STT (Whisper через тот же сервер) | ✅ |
+| 4 | Whisper STT — OpenAI API / faster-whisper локально | ✅ |
+| 5 | LLM agent с tool use (Anthropic/OpenAI) | ✅ |
 | 6 | GenericAPI booking connector | ✅ |
 | 7 | YClients / Dikidi / Altegio адаптеры | ⏳ |
-| 8 | Twilio / Asterisk провайдеры | ⏳ |
-| 9 | Production hardening (Langfuse, retries) | ⏳ |
+| 8 | Twilio / Asterisk — реалтайм send_audio (WS/Media Streams) | ⏳ |
+| 9 | Production hardening: auth на /call и /webhooks, CI, retries (generic_api) | ✅ |
+| 10 | Per-provider проверка подписи вебхуков (Twilio HMAC и т.д.) | ⏳ |
+| 11 | Langfuse / observability | ⏳ |
+
+Статусы 2/8 (реальная телефония) намеренно заблокированы на уровне кода:
+`Orchestrator.handle_callback` отказывает с ошибкой, если у провайдера
+`supports_realtime_audio = False`, — чтобы не дозваниваться и не ронять
+реальный звонок клиента впустую.
 
 ## 📄 Лицензия
 

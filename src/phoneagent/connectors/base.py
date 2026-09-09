@@ -62,7 +62,7 @@ class BaseBookingConnector(ABC):
         """Получить запись по ID (для верификации)."""
         ...
 
-    async def __aenter__(self) -> "BaseBookingConnector":
+    async def __aenter__(self) -> BaseBookingConnector:
         await self.connect()
         return self
 

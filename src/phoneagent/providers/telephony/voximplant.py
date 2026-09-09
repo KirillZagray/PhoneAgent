@@ -73,7 +73,7 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
         )
         response.raise_for_status()
         result = response.json()
-        if "error" in result and result["error"]:
+        if result.get("error"):
             msg = f"Voximplant API error: {result['error']}"
             raise RuntimeError(msg)
         return result  # type: ignore[no-any-return]
@@ -139,7 +139,7 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
         # Реальная реализация потребует polling или WebSocket.
         # Для MVP события приходят через webhook endpoint (см. api/webhooks.py)
         while False:
-            yield  # type: ignore[unreachable]
+            yield
 
     async def send_audio(self, call_id: str, audio: AsyncIterator[bytes]) -> None:
         """Стриминг аудио в звонок через MediaStream (TTS через VoxEngine).

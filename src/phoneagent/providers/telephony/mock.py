@@ -23,6 +23,7 @@ class MockTelephonyProvider(BaseTelephonyProvider):
     """Имитация телефонного звонка для локальной разработки."""
 
     name = "mock"
+    supports_realtime_audio = True
 
     def __init__(self) -> None:
         self._events: asyncio.Queue[CallEvent] = asyncio.Queue()
@@ -76,7 +77,7 @@ class MockTelephonyProvider(BaseTelephonyProvider):
             return CallStatus(call_id=call_id, status=CallStatusEnum.FAILED)
         return CallStatus(call_id=call_id, status=ref.status)
 
-    async def events(self):
+    async def events(self) -> AsyncIterator[CallEvent]:
         """Эмулирует поток событий от провайдера (async generator)."""
         while self._connected:
             try:

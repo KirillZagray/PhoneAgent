@@ -19,7 +19,6 @@ from phoneagent.utils.audio import (
     wav_to_pcm,
 )
 
-
 # ── Logging ─────────────────────────────────────────────
 
 
@@ -73,13 +72,13 @@ def configure_logging() -> None:
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """Возвращает настроенный логгер."""
-    return structlog.get_logger(name or "phoneagent")
+    return structlog.get_logger(name or "phoneagent")  # type: ignore[no-any-return]
 
 
 __all__ = [
+    "SUPPORTED_FORMATS",
     "configure_logging",
     "get_logger",
-    "SUPPORTED_FORMATS",
     "is_valid_format",
     "pcm_to_ulaw",
     "pcm_to_wav",

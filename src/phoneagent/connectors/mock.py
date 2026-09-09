@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from phoneagent.connectors.base import BaseBookingConnector
 from phoneagent.models.booking import (

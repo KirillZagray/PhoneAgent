@@ -99,11 +99,11 @@ class RedisStateStore(BaseStateStore):
 
 
 def build_state_store() -> BaseStateStore:
-    """Создаёт хранилище по настройкам (для прод — Redis)."""
+    """Создаёт хранилище по настройкам (для прод — Redis, для dev/тестов — memory)."""
     settings = get_settings()
-    if str(settings.redis_url).startswith("redis://"):
-        return RedisStateStore()
-    return InMemoryStateStore()
+    if settings.state_store == "memory":
+        return InMemoryStateStore()
+    return RedisStateStore()
 
 
 __all__ = [

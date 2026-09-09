@@ -6,18 +6,14 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import date, datetime
 from typing import Any
 
 from phoneagent.config import get_settings
-from phoneagent.connectors.factory import build_booking_connector
 from phoneagent.connectors.base import BaseBookingConnector
-from phoneagent.core.agent import (
-    AgentResponse,
-    BaseLLMAgent,
-    TOOL_DESCRIPTIONS,
-    build_llm_agent,
-)
+from phoneagent.connectors.factory import build_booking_connector
+from phoneagent.core.agent import TOOL_DESCRIPTIONS, BaseLLMAgent, ToolExecutor, build_llm_agent
 from phoneagent.core.state_store import BaseStateStore, build_state_store
 from phoneagent.models.booking import BookingRequest
 from phoneagent.models.conversation import (
@@ -47,11 +43,9 @@ class Orchestrator:
         2. Приветствие клиента (TTS → send_audio)
         3. Получение аудио от клиента (events)
         4. Распознавание речи (STT)
-        5. Передача текста LLM-агенту
-        6. Получение ответа от агента + tool calls
-        7. Выполнение tool calls через booking_connector
-        8. Синтез ответа (TTS) → клиенту
-        9. Завершение/эскалация
+        5. Передача текста LLM-агенту (агент сам разруливает tool calls)
+        6. Синтез ответа (TTS) → клиенту
+        7. Завершение/эскалация
     """
 
     def __init__(
@@ -70,6 +64,29 @@ class Orchestrator:
         self.booking = booking
         self.state_store = state_store
         self.settings = get_settings()
+        # Держим ссылки на фоновые задачи звонков — иначе asyncio может
+        # собрать таск сборщиком мусора до его завершения.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    async def aclose(self) -> None:
+        """Закрывает все клиенты провайдеров (вызывается при shutdown приложения)."""
+        for coro in (
+            self.telephony.disconnect(),
+            self.stt.disconnect(),
+            self.tts.disconnect(),
+            self.llm.disconnect(),
+            self.booking.disconnect(),
+        ):
+            try:
+                await coro
+            except Exception:
+                logger.warning("provider_disconnect_failed", exc_info=True)
+        disconnect = getattr(self.state_store, "disconnect", None)
+        if disconnect is not None:
+            try:
+                await disconnect()
+            except Exception:
+                logger.warning("state_store_disconnect_failed", exc_info=True)
 
     async def handle_callback(
         self,
@@ -83,6 +100,15 @@ class Orchestrator:
         Returns:
             call_id
         """
+        if not self.telephony.supports_realtime_audio:
+            msg = (
+                f"Telephony provider '{self.telephony.name}' does not implement "
+                "real-time audio streaming yet (see README roadmap) — refusing to "
+                "place a real call that would connect and immediately fail. "
+                "Use TELEPHONY_PROVIDER=mock, or /call/text for a text-only demo."
+            )
+            raise RuntimeError(msg)
+
         language = language or self.settings.default_language
 
         # 1. Инициируем звонок
@@ -102,10 +128,55 @@ class Orchestrator:
         )
         await self.state_store.set(state)
 
-        # 3. Запускаем обработку звонка в фоне
-        asyncio.create_task(self._process_call(call_ref.call_id))
+        # 3. Запускаем обработку звонка в фоне (ссылку держим в self._background_tasks)
+        task = asyncio.create_task(self._process_call(call_ref.call_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         return call_ref.call_id
+
+    async def handle_text_message(
+        self,
+        *,
+        call_id: str | None,
+        salon_id: str,
+        client_phone: str,
+        language: str,
+        text: str,
+    ) -> dict[str, str]:
+        """Текстовый turn без телефонии — для отладки и чат-виджета.
+
+        Если call_id не передан — создаёт новую сессию и возвращает её id,
+        дальнейшие сообщения продолжают тот же диалог по этому call_id.
+        """
+        if call_id:
+            state = await self.state_store.get(call_id)
+            if state is None:
+                msg = f"Unknown call_id: {call_id}"
+                raise ValueError(msg)
+        else:
+            call_id = f"text-{uuid.uuid4().hex[:12]}"
+            state = ConversationState(
+                call_id=call_id,
+                salon_id=salon_id,
+                client_phone=client_phone,
+                language=language,
+                step=ConversationStep.GREETING,
+            )
+
+        state.messages.append(Message(role=Role.USER, content=text))
+        state.updated_at = datetime.now()
+
+        response = await self.llm.run_turn(state, text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state))
+
+        if response.text:
+            state.messages.append(Message(role=Role.ASSISTANT, content=response.text))
+        if response.is_final and state.step == ConversationStep.CONFIRMATION:
+            state.step = ConversationStep.END
+
+        await self.state_store.set(state)
+
+        return {"call_id": call_id, "reply": response.text, "step": state.step.value}
 
     async def _process_call(self, call_id: str) -> None:
         """Главный цикл обработки одного звонка."""
@@ -116,7 +187,7 @@ class Orchestrator:
 
         try:
             # Приветствие
-            await self._say(state, f"Здравствуйте! Это салон красоты. Я AI-ассистент, помогу записаться на услугу.")
+            await self._say(state, "Здравствуйте! Это салон красоты. Я AI-ассистент, помогу записаться на услугу.")
 
             # Главный цикл диалога
             while state.step not in (ConversationStep.END, ConversationStep.ESCALATE):
@@ -136,21 +207,10 @@ class Orchestrator:
                 state.messages.append(Message(role=Role.USER, content=user_text))
                 state.updated_at = datetime.now()
 
-                # Один turn диалога
-                response = await self.llm.run_turn(state, user_text, TOOL_DESCRIPTIONS)
-
-                # Выполняем tool calls
-                for tool_call in response.tool_calls:
-                    tool_result = await self._execute_tool(state, tool_call.name, tool_call.arguments)
-                    state.messages.append(
-                        Message(
-                            role=Role.TOOL,
-                            content=str(tool_result),
-                            tool_call_id=tool_call.call_id,
-                        )
-                    )
-                    # Если агент закончил — даём ещё один turn с результатом
-                    response = await self.llm.run_turn(state, "", TOOL_DESCRIPTIONS)
+                # Один turn диалога — LLM сам разруливает tool calls внутри себя
+                response = await self.llm.run_turn(
+                    state, user_text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state)
+                )
 
                 # Произносим ответ
                 if response.text:
@@ -167,25 +227,26 @@ class Orchestrator:
             await self.telephony.hangup(call_id)
             logger.info("call_completed", call_id=call_id, step=state.step.value)
 
-        except Exception as e:
-            logger.error("call_failed", call_id=call_id, error=str(e), exc_info=True)
+        except Exception:
+            logger.exception("call_failed", call_id=call_id)
             try:
                 await self.telephony.hangup(call_id)
             except Exception:
-                pass
+                # best-effort cleanup — не должно маскировать исходную ошибку выше
+                logger.warning("hangup_after_failure_failed", call_id=call_id, exc_info=True)
 
     async def _listen(self, state: ConversationState) -> str:
         """Получает реплику клиента.
 
-        В mock-режиме — читает из инжектированного STT-текста.
-        В реальном — стримит аудио из telephony → STT.
+        В mock-режиме — здесь нет реального аудио-стрима, поэтому voice-цикл
+        для mock-телефонии не ведёт содержательный диалог (используйте
+        /call/text для полноценного текстового прогона FSM).
+        В реальном режиме — стримит аудио из telephony в STT (ждёт реализации
+        провайдер-специфичного WebSocket/Media Streams моста).
         """
-        # В mock-режиме: ждём инжект через STT provider
-        if isinstance(self.stt, type(self.stt).__mro__[0]) and self.stt.name == "mock":  # type: ignore[attr-defined]
-            # Подождём чуть-чуть и вернём инжектированный текст
+        if self.stt.name == "mock":
             await asyncio.sleep(0.5)
-            # У мок-провайдеров есть инжект — здесь упрощённо
-            # В реальной реализации — подписка на события telephony
+            return ""
 
         # Заглушка: в реальной реализации — чтение из очереди событий
         # и стриминг аудио в STT
@@ -209,6 +270,14 @@ class Orchestrator:
             await self.telephony.send_text(state.call_id, text)
         except NotImplementedError:
             pass
+
+    def _tool_executor(self, state: ConversationState) -> ToolExecutor:
+        """Замыкание над state — передаётся LLM-агенту как execute_tool."""
+
+        async def _execute(name: str, arguments: dict[str, Any]) -> Any:
+            return await self._execute_tool(state, name, arguments)
+
+        return _execute
 
     async def _execute_tool(self, state: ConversationState, name: str, arguments: dict[str, Any]) -> Any:
         """Выполняет tool call через booking connector."""
@@ -254,15 +323,13 @@ class Orchestrator:
             msg = f"Unknown tool: {name}"
             return {"error": msg}
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — ошибка одного tool call не должна ронять весь turn
             logger.error("tool_execution_failed", tool=name, error=str(e))
             return {"error": str(e)}
 
 
 async def build_orchestrator() -> Orchestrator:
     """Собирает все провайдеры и создаёт orchestrator."""
-    settings = get_settings()
-
     telephony = build_telephony_provider()
     stt = build_stt_provider()
     tts = build_tts_provider()

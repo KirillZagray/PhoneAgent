@@ -12,7 +12,6 @@ from phoneagent.models.call import (
     CallStatus,
     CallStatusEnum,
 )
-from phoneagent.models.booking import Master, Service, Slot  # noqa: F401
 from phoneagent.models.conversation import (
     ConversationState,
     ConversationStep,
@@ -25,15 +24,15 @@ ConversationState.model_rebuild()
 
 __all__ = [
     "Booking",
-    "Master",
-    "Service",
-    "Slot",
     "CallEvent",
     "CallRef",
     "CallStatus",
     "CallStatusEnum",
     "ConversationState",
     "ConversationStep",
+    "Master",
     "Message",
     "Role",
+    "Service",
+    "Slot",
 ]

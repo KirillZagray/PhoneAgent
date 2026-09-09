@@ -11,15 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install uv for fast Python package management
 RUN pip install --no-cache-dir uv
 
-# Copy and install deps
-COPY pyproject.toml ./
-RUN uv pip install --system --no-cache .
+# Copy and install deps — uv.lock pinned, reproducible build
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-cache --no-install-project
 
 # Copy source
 COPY src/ ./src/
+RUN uv sync --frozen --no-cache
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src
+    PATH="/app/.venv/bin:$PATH"
+
+RUN useradd --create-home --uid 1000 phoneagent && chown -R phoneagent:phoneagent /app
+USER phoneagent
 
 EXPOSE 8000
 

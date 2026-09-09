@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from io import BytesIO
+from typing import Any
 
-import httpx
 from openai import AsyncOpenAI
 
 from phoneagent.config import get_settings
@@ -102,10 +102,10 @@ class FasterWhisperProvider(BaseSTTProvider):
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
-        self._model: object | None = None
+        self._model: Any = None
 
     async def connect(self) -> None:
-        from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+        from faster_whisper import WhisperModel  # type: ignore
 
         self._model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
         logger.info("faster_whisper_loaded", model=self.model_size, device=self.device)
@@ -120,13 +120,19 @@ class FasterWhisperProvider(BaseSTTProvider):
         pcm = wav_to_pcm(audio) if audio[:4] == b"RIFF" else audio
         # faster_whisper — sync API, оборачиваем в to_thread
         import asyncio
+        import audioop
+
         import numpy as np
 
-        def _transcribe() -> tuple[list[object], str]:
-            segments, info = self._model.transcribe(  # type: ignore[attr-defined]
+        # faster-whisper (как и OpenAI Whisper) ожидает 16kHz mono float32 —
+        # телефонная линия обычно 8kHz, ресемплим перед подачей в модель.
+        if sample_rate != 16000:
+            pcm, _ = audioop.ratecv(pcm, 2, 1, sample_rate, 16000, None)
+
+        def _transcribe() -> tuple[list[Any], str]:
+            segments, info = self._model.transcribe(
                 np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0,
                 language=language,
-                sample_rate=sample_rate,
             )
             return list(segments), info.language
 

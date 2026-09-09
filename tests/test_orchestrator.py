@@ -66,8 +66,6 @@ async def test_mock_booking_create_booking() -> None:
 async def test_mock_llm_agent_greeting() -> None:
     from phoneagent.models.conversation import (
         ConversationState,
-        ConversationStep,
-        Role,
     )
     agent = MockLLMAgent()
     await agent.connect()
