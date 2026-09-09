@@ -8,10 +8,14 @@ HTTP API (по умолчанию слушает http://localhost:3900):
 STT (распознавание) того же сервера — см. `providers/stt/voicestudio.py`
 (VoiceStudio запускает Whisper-семейство ASR — WhisperX/faster-whisper — под
 капотом и отдаёт его через тот же OpenAI-совместимый API).
+
+Запрашиваем WAV (частота у движков VoiceStudio разная — 22.05/24/44.1 kHz) и
+приводим к контракту пайплайна: PCM s16le mono `sample_rate`.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
@@ -19,8 +23,11 @@ import httpx
 from phoneagent.config import get_settings
 from phoneagent.providers.tts.base import BaseTTSProvider
 from phoneagent.utils import get_logger
+from phoneagent.utils.audio import wav_to_pcm_resampled
 
 logger = get_logger(__name__)
+
+STREAM_CHUNK = 4096
 
 
 class VoiceStudioTTSProvider(BaseTTSProvider):
@@ -37,7 +44,6 @@ class VoiceStudioTTSProvider(BaseTTSProvider):
             base_url=str(self.settings.voicestudio_url),
             timeout=60.0,
         )
-        # Проверяем доступность
         try:
             response = await self._client.get("/v1/audio/voices", timeout=5.0)
             response.raise_for_status()
@@ -61,24 +67,20 @@ class VoiceStudioTTSProvider(BaseTTSProvider):
             msg = "VoiceStudio client not connected"
             raise RuntimeError(msg)
 
-        voice_id = voice or self.settings.voicestudio_voice_id
-
-        # VoiceStudio API принимает JSON или multipart
-        # Проверяем какой формат поддерживается — упрощённо используем JSON
         response = await self._client.post(
             "/v1/audio/speech",
             json={
                 "model": "tts-1",
                 "input": text,
-                "voice": voice_id,
+                "voice": voice or self.settings.voicestudio_voice_id,
                 "language": language,
                 "response_format": "wav",
             },
         )
         response.raise_for_status()
-        audio_data = response.content
-        logger.info("voicestudio_synthesized", bytes=len(audio_data), text_len=len(text))
-        return audio_data
+        pcm = await asyncio.to_thread(wav_to_pcm_resampled, response.content, sample_rate)
+        logger.debug("voicestudio_synthesized", bytes=len(pcm), text_len=len(text))
+        return pcm
 
     async def synthesize_stream(
         self,
@@ -88,23 +90,9 @@ class VoiceStudioTTSProvider(BaseTTSProvider):
         language: str = "ru",
         sample_rate: int = 8000,
     ) -> AsyncIterator[bytes]:
-        if self._client is None:
-            msg = "VoiceStudio client not connected"
-            raise RuntimeError(msg)
-
-        voice_id = voice or self.settings.voicestudio_voice_id
-        async with self._client.stream(
-            "POST",
-            "/v1/audio/speech",
-            json={
-                "model": "tts-1",
-                "input": text,
-                "voice": voice_id,
-                "language": language,
-                "response_format": "wav",
-                "stream": True,
-            },
-        ) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes(chunk_size=4096):
-                yield chunk
+        # ponytail: WAV-стрим нельзя ресемплить почанково без разбора заголовка —
+        # синтезируем целиком и режем. Настоящий стриминг — вместе с send_audio
+        # у реального telephony-провайдера (там же и pcm-формат без заголовка).
+        pcm = await self.synthesize(text, voice=voice, language=language, sample_rate=sample_rate)
+        for i in range(0, len(pcm), STREAM_CHUNK):
+            yield pcm[i : i + STREAM_CHUNK]

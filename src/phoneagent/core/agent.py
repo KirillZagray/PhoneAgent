@@ -84,15 +84,25 @@ class BaseLLMAgent(ABC):
         ...
 
     def _text_history(self, state: ConversationState) -> list[dict[str, str]]:
-        """История для API: только законченные user/assistant реплики.
+        """История для API: только законченные user/assistant реплики, последние N.
 
         Tool-раунды не реплеим — они уже разрешены внутри своего turn'а.
         """
-        return [
+        history = [
             {"role": m.role.value, "content": m.content}
             for m in state.messages
             if m.role in (Role.USER, Role.ASSISTANT)
         ]
+        return history[-get_settings().max_history_messages :]
+
+    def _system_prompt(self, state: ConversationState) -> str:
+        settings = get_settings()
+        return get_system_prompt(
+            state.language,
+            salon_name=settings.salon_name,
+            working_hours=settings.salon_working_hours,
+            timezone=settings.salon_timezone,
+        )
 
 
 # ── Tool descriptions (передаются в LLM) ──────────────────────
@@ -132,7 +142,10 @@ TOOL_DESCRIPTIONS = [
     },
     {
         "name": "create_booking",
-        "description": "Создать запись на услугу. Только после подтверждения клиента.",
+        "description": (
+            "Создать запись на услугу. Только после явного подтверждения клиента. "
+            "Телефон клиента системе уже известен — передавать не нужно."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -140,10 +153,23 @@ TOOL_DESCRIPTIONS = [
                 "master_id": {"type": "string", "description": "ID мастера"},
                 "date": {"type": "string", "description": "Дата YYYY-MM-DD"},
                 "time": {"type": "string", "description": "Время HH:MM"},
-                "client_phone": {"type": "string", "description": "Телефон клиента"},
                 "client_name": {"type": "string", "description": "Имя клиента (опционально)"},
             },
-            "required": ["service_id", "master_id", "date", "time", "client_phone"],
+            "required": ["service_id", "master_id", "date", "time"],
+        },
+    },
+    {
+        "name": "escalate_to_human",
+        "description": (
+            "Перевести звонок на живого администратора: клиент просит человека, "
+            "недоволен, или задача вне твоих возможностей. Завершает диалог с ассистентом."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Краткая причина эскалации"},
+            },
+            "required": ["reason"],
         },
     },
 ]
@@ -179,6 +205,18 @@ class MockLLMAgent(BaseLLMAgent):
         execute_tool: ToolExecutor | None = None,
     ) -> AgentResponse:
         text_lower = user_message.lower()
+
+        # Эскалация — единственный tool, который мок реально исполняет (через execute_tool),
+        # чтобы путь ESCALATE в Orchestrator был проверяем без реального LLM.
+        if any(w in text_lower for w in ("администратор", "оператор", "человек")):
+            call = ToolCall(name="escalate_to_human", arguments={"reason": "client asked"}, call_id="esc_1")
+            if execute_tool is not None:
+                await execute_tool(call.name, call.arguments)
+            return AgentResponse(
+                text="Переключаю вас на администратора, оставайтесь на линии.",
+                tool_calls=[call],
+                is_final=True,
+            )
 
         # Грубая эвристика для теста FSM
         if state.step.value == "greeting":
@@ -228,7 +266,12 @@ class AnthropicLLMAgent(BaseLLMAgent):
             msg = "ANTHROPIC_API_KEY not set"
             raise RuntimeError(msg)
         from anthropic import AsyncAnthropic
-        self._client = AsyncAnthropic(api_key=self.settings.anthropic_api_key)
+
+        self._client = AsyncAnthropic(
+            api_key=self.settings.anthropic_api_key,
+            timeout=self.settings.llm_timeout_seconds,
+            max_retries=1,
+        )
         logger.info("anthropic_connected", model=self.settings.anthropic_model)
 
     async def disconnect(self) -> None:
@@ -264,7 +307,7 @@ class AnthropicLLMAgent(BaseLLMAgent):
             response = await self._client.messages.create(
                 model=self.settings.anthropic_model,
                 max_tokens=512,
-                system=get_system_prompt(state.language),
+                system=self._system_prompt(state),
                 tools=anthropic_tools,
                 messages=messages,
             )
@@ -321,7 +364,12 @@ class OpenAILLMAgent(BaseLLMAgent):
             msg = "OPENAI_API_KEY not set"
             raise RuntimeError(msg)
         from openai import AsyncOpenAI
-        self._client = AsyncOpenAI(api_key=self.settings.openai_api_key)
+
+        self._client = AsyncOpenAI(
+            api_key=self.settings.openai_api_key,
+            timeout=self.settings.llm_timeout_seconds,
+            max_retries=1,
+        )
         logger.info("openai_connected", model=self.settings.openai_model)
 
     async def disconnect(self) -> None:
@@ -353,7 +401,7 @@ class OpenAILLMAgent(BaseLLMAgent):
         ]
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": get_system_prompt(state.language)},
+            {"role": "system", "content": self._system_prompt(state)},
             *self._text_history(state),
         ]
         if user_message:

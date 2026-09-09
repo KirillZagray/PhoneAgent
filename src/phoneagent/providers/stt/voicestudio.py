@@ -76,7 +76,7 @@ class VoiceStudioSTTProvider(BaseSTTProvider):
         )
         response.raise_for_status()
         text = str(response.json().get("text", ""))
-        logger.info("voicestudio_transcribed", text=text[:80])
+        logger.debug("voicestudio_transcribed", text=text[:80])
         return text
 
     async def transcribe_stream(

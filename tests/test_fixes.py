@@ -20,6 +20,7 @@ from phoneagent.providers.stt.voicestudio import VoiceStudioSTTProvider
 from phoneagent.providers.telephony.mock import MockTelephonyProvider
 from phoneagent.providers.telephony.twilio import TwilioTelephonyProvider
 from phoneagent.providers.tts.voicestudio import VoiceStudioTTSProvider
+from phoneagent.utils.audio import pcm_to_wav
 
 # ── generic_api.py: create_booking больше не шлёт пустое тело ─────────────
 
@@ -109,8 +110,11 @@ async def test_voicestudio_tts_hits_correct_endpoint():
 
     async with respx.mock(base_url="http://localhost:3900") as mock:
         mock.get("/v1/audio/voices").mock(return_value=httpx.Response(200, json=[]))
+        # Реальный WAV 24 kHz (как отдают движки VoiceStudio) — провайдер обязан
+        # привести его к PCM 8 kHz по контракту пайплайна.
+        wav_24k = pcm_to_wav(b"\x00\x01" * 24000, sample_rate=24000)
         speech_route = mock.post("/v1/audio/speech").mock(
-            return_value=httpx.Response(200, content=b"RIFF....WAVEfmt ")
+            return_value=httpx.Response(200, content=wav_24k)
         )
 
         await provider.connect()
@@ -126,7 +130,8 @@ async def test_voicestudio_tts_hits_correct_endpoint():
     payload = _json.loads(request.content)
     assert payload["model"] == "tts-1"
     assert payload["input"] == "Привет"
-    assert audio.startswith(b"RIFF")
+    assert not audio.startswith(b"RIFF")  # сырой PCM, без заголовка
+    assert abs(len(audio) - 8000 * 2) <= 4  # 1 секунда PCM s16 mono @ 8 kHz
 
 
 # ── VoiceStudio STT: та же связка Whisper/VoiceStudio, что просил юзер ─────
@@ -265,7 +270,7 @@ def test_text_endpoint_full_flow(monkeypatch: pytest.MonkeyPatch) -> None:
 
     app = create_app()
     with TestClient(app) as client:
-        resp = client.post("/call/text", json={"text": "Здравствуйте"})
+        resp = client.post("/call/text", json={"text": "Здравствуйте", "phone": "+79991234567"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["call_id"]

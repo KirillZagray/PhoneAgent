@@ -1,7 +1,7 @@
 [project]
 name = "phoneagent"
-version = "0.1.0"
-description = "Универсальный микросервис для автоматизации телефонных записей с AI-ассистентом"
+version = "0.2.0"
+description = "Микросервис для автоматизации телефонных записей с AI-ассистентом"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -14,19 +14,21 @@ dependencies = [
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
     "httpx>=0.27.0",
-    "websockets>=13.0",
     "structlog>=24.4.0",
     "redis>=5.2.0",
-    "python-multipart>=0.0.12",
     "tenacity>=9.0.0",
     "edge-tts>=6.1.0",
     "anthropic>=0.39.0",
     "openai>=1.55.0",
-    "faster-whisper>=1.0.0",
     "pyyaml>=6.0",
+    # audioop убран из stdlib в 3.13 — тот же модуль из PyPI
+    "audioop-lts>=0.2.1; python_version >= '3.13'",
 ]
 
 [project.optional-dependencies]
+# Локальный Whisper тянет ctranslate2/numpy (сотни МБ). Тем, кто на VoiceStudio
+# или whisper_api, он не нужен: `uv sync --extra local-stt`.
+local-stt = ["faster-whisper>=1.0.0"]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -34,6 +36,8 @@ dev = [
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "respx>=0.21.0",
+    "fakeredis>=2.26.0",
+    "types-pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -52,7 +56,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 # ponytail: DTZ (naive datetime.now()) и PYI034/036 (Self/exit-annotation stubs)
-# — pre-existing paттерн по всему проекту (ConversationState/Message timestamps),
+# — pre-existing паттерн по всему проекту (ConversationState/Message timestamps),
 # не связаны с багами этого прохода. Апгрейд — отдельный проход на tz-aware
 # datetime везде разом, а не точечно в паре файлов.
 ignore = ["DTZ001", "DTZ005", "PYI034", "PYI036"]
@@ -61,7 +65,16 @@ ignore = ["DTZ001", "DTZ005", "PYI034", "PYI036"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+filterwarnings = [
+    # audioop deprecated в 3.11-3.12, в 3.13 берётся из audioop-lts — предупреждение ожидаемое
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+# Опциональные / без стабов
+module = ["faster_whisper", "faster_whisper.*", "numpy", "edge_tts", "edge_tts.*", "audioop"]
+ignore_missing_imports = true

@@ -44,11 +44,13 @@ class TwilioTelephonyProvider(BaseTelephonyProvider):
             await self._client.aclose()
 
     async def make_call(self, to_phone: str, **kwargs: Any) -> CallRef:
-        webhook_url = kwargs.get("webhook_url") or ""
+        # Twilio ждёт по Url TwiML-документ, а не корень сервиса. Роут появится
+        # вместе с реализацией <Stream> на этапе 8 — путь фиксируем уже сейчас.
+        base = (kwargs.get("webhook_url") or "").rstrip("/")
         body = {
             "To": to_phone,
             "From": self.settings.twilio_caller_id,
-            "Url": webhook_url,
+            "Url": f"{base}/webhooks/twilio/voice",
         }
         if self._client is None:
             msg = "Twilio client not connected"

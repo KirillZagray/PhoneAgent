@@ -2,10 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for audio
+# ffmpeg — только для edge_tts (MP3 -> PCM). VoiceStudio/ElevenLabs отдают PCM сами.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast Python package management

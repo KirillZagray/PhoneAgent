@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 from structlog.types import EventDict, Processor
@@ -75,13 +76,37 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(name or "phoneagent")  # type: ignore[no-any-return]
 
 
+# ── PII / secrets redaction ─────────────────────────────
+
+
+def mask_phone(phone: str) -> str:
+    """+79991234567 -> +7999***4567. Номер клиента — персональные данные, в логи целиком не пишем."""
+    if len(phone) < 8:
+        return "***"
+    return f"{phone[:5]}***{phone[-4:]}"
+
+
+def redact_url(url: str) -> str:
+    """redis://:secret@host:6379/0 -> redis://:***@host:6379/0."""
+    parsed = urlsplit(url)
+    if not parsed.password:
+        return url
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    user = f"{parsed.username or ''}:***@"
+    return urlunsplit((parsed.scheme, user + host, parsed.path, parsed.query, parsed.fragment))
+
+
 __all__ = [
     "SUPPORTED_FORMATS",
     "configure_logging",
     "get_logger",
     "is_valid_format",
+    "mask_phone",
     "pcm_to_ulaw",
     "pcm_to_wav",
+    "redact_url",
     "ulaw_to_pcm",
     "wav_to_pcm",
 ]

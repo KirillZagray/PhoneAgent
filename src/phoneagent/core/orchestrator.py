@@ -10,6 +10,8 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
+import structlog
+
 from phoneagent.config import get_settings
 from phoneagent.connectors.base import BaseBookingConnector
 from phoneagent.connectors.factory import build_booking_connector
@@ -30,9 +32,15 @@ from phoneagent.providers.factory import (
 from phoneagent.providers.stt.base import BaseSTTProvider
 from phoneagent.providers.telephony.base import BaseTelephonyProvider
 from phoneagent.providers.tts.base import BaseTTSProvider
-from phoneagent.utils import get_logger
+from phoneagent.utils import get_logger, mask_phone
 
 logger = get_logger(__name__)
+
+TERMINAL_STEPS = (ConversationStep.END, ConversationStep.ESCALATE)
+
+
+class DuplicateCallbackError(Exception):
+    """На этот номер звонок уже инициирован недавно (двойной клик / спам)."""
 
 
 class Orchestrator:
@@ -88,6 +96,10 @@ class Orchestrator:
             except Exception:
                 logger.warning("state_store_disconnect_failed", exc_info=True)
 
+    async def _save(self, state: ConversationState) -> None:
+        state.updated_at = datetime.now()
+        await self.state_store.set(state, ttl_seconds=self.settings.state_ttl_seconds)
+
     async def handle_callback(
         self,
         client_phone: str,
@@ -109,6 +121,12 @@ class Orchestrator:
             )
             raise RuntimeError(msg)
 
+        if not await self.state_store.acquire_lock(
+            f"callback:{client_phone}", self.settings.callback_dedupe_seconds
+        ):
+            logger.info("callback_deduplicated", phone=mask_phone(client_phone))
+            raise DuplicateCallbackError(client_phone)
+
         language = language or self.settings.default_language
 
         # 1. Инициируем звонок
@@ -116,7 +134,7 @@ class Orchestrator:
             client_phone,
             webhook_url=str(self.settings.public_webhook_base_url),
         )
-        logger.info("call_initiated", call_id=call_ref.call_id, phone=client_phone)
+        logger.info("call_initiated", call_id=call_ref.call_id, phone=mask_phone(client_phone))
 
         # 2. Создаём начальное состояние
         state = ConversationState(
@@ -126,7 +144,7 @@ class Orchestrator:
             language=language,
             step=ConversationStep.GREETING,
         )
-        await self.state_store.set(state)
+        await self._save(state)
 
         # 3. Запускаем обработку звонка в фоне (ссылку держим в self._background_tasks)
         task = asyncio.create_task(self._process_call(call_ref.call_id))
@@ -164,76 +182,78 @@ class Orchestrator:
                 step=ConversationStep.GREETING,
             )
 
-        state.messages.append(Message(role=Role.USER, content=text))
-        state.updated_at = datetime.now()
+        with structlog.contextvars.bound_contextvars(call_id=call_id):
+            if state.step in TERMINAL_STEPS:
+                return {"call_id": call_id, "reply": "", "step": state.step.value}
 
-        response = await self.llm.run_turn(state, text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state))
+            response = await self._run_turn(state, text)
+            await self._save(state)
 
+        return {"call_id": call_id, "reply": response.text, "step": state.step.value}
+
+    async def _run_turn(self, state: ConversationState, user_text: str) -> Any:
+        """Один turn: реплика клиента → LLM (+tools) → текст ответа. Двигает FSM."""
+        state.messages.append(Message(role=Role.USER, content=user_text))
+        response = await self.llm.run_turn(
+            state, user_text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state)
+        )
         if response.text:
             state.messages.append(Message(role=Role.ASSISTANT, content=response.text))
         if response.is_final and state.step == ConversationStep.CONFIRMATION:
             state.step = ConversationStep.END
-
-        await self.state_store.set(state)
-
-        return {"call_id": call_id, "reply": response.text, "step": state.step.value}
+        return response
 
     async def _process_call(self, call_id: str) -> None:
-        """Главный цикл обработки одного звонка."""
-        state = await self.state_store.get(call_id)
-        if state is None:
-            logger.error("call_state_missing", call_id=call_id)
-            return
-
-        try:
-            # Приветствие
-            await self._say(state, "Здравствуйте! Это салон красоты. Я AI-ассистент, помогу записаться на услугу.")
-
-            # Главный цикл диалога
-            while state.step not in (ConversationStep.END, ConversationStep.ESCALATE):
-                # Ждём от клиента аудио/текст
-                user_text = await self._listen(state)
-                if not user_text:
-                    # Таймаут / нет ответа
-                    if state.retry_count >= self.settings.max_retries:
-                        await self._say(state, "К сожалению, я вас не слышу. До свидания!")
-                        state.step = ConversationStep.END
-                        break
-                    state.retry_count += 1
-                    await self._say(state, "Алло, вы меня слышите?")
-                    continue
-
-                state.retry_count = 0
-                state.messages.append(Message(role=Role.USER, content=user_text))
-                state.updated_at = datetime.now()
-
-                # Один turn диалога — LLM сам разруливает tool calls внутри себя
-                response = await self.llm.run_turn(
-                    state, user_text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state)
-                )
-
-                # Произносим ответ
-                if response.text:
-                    await self._say(state, response.text)
-                    state.messages.append(Message(role=Role.ASSISTANT, content=response.text))
-
-                # Если финальный turn — выходим
-                if response.is_final and state.step == ConversationStep.CONFIRMATION:
-                    state.step = ConversationStep.END
-
-                await self.state_store.set(state)
-
-            # Завершение
-            await self.telephony.hangup(call_id)
-            logger.info("call_completed", call_id=call_id, step=state.step.value)
-
-        except Exception:
-            logger.exception("call_failed", call_id=call_id)
+        """Главный цикл обработки одного звонка. Жёстко ограничен call_timeout_seconds."""
+        with structlog.contextvars.bound_contextvars(call_id=call_id):
+            state = await self.state_store.get(call_id)
+            if state is None:
+                logger.error("call_state_missing")
+                return
             try:
-                await self.telephony.hangup(call_id)
+                async with asyncio.timeout(self.settings.call_timeout_seconds):
+                    await self._dialog_loop(state)
+            except TimeoutError:
+                logger.warning("call_timeout", seconds=self.settings.call_timeout_seconds)
+                state.step = ConversationStep.END
+                await self._say_safe(state, "К сожалению, время звонка истекло. До свидания!")
             except Exception:
-                # best-effort cleanup — не должно маскировать исходную ошибку выше
-                logger.warning("hangup_after_failure_failed", call_id=call_id, exc_info=True)
+                logger.exception("call_failed")
+            finally:
+                await self._save(state)
+                try:
+                    await self.telephony.hangup(call_id)
+                except Exception:
+                    logger.warning("hangup_failed", exc_info=True)
+                logger.info("call_completed", step=state.step.value)
+
+    async def _dialog_loop(self, state: ConversationState) -> None:
+        await self._say(
+            state,
+            f"Здравствуйте! Это {self.settings.salon_name}. Я AI-ассистент, помогу записаться на услугу.",
+        )
+
+        while state.step not in TERMINAL_STEPS:
+            user_text = await self._listen(state)
+            if not user_text:
+                if state.retry_count >= self.settings.max_retries:
+                    await self._say(state, "К сожалению, я вас не слышу. До свидания!")
+                    state.step = ConversationStep.END
+                    break
+                state.retry_count += 1
+                await self._say(state, "Алло, вы меня слышите?")
+                continue
+
+            state.retry_count = 0
+            response = await self._run_turn(state, user_text)
+            if response.text:
+                await self._say(state, response.text)
+            await self._save(state)
+
+        if state.step == ConversationStep.ESCALATE:
+            # ponytail: реального перевода звонка (transfer) в ABC телефонии нет —
+            # добавить BaseTelephonyProvider.transfer() вместе с реальным провайдером.
+            logger.info("call_escalated", reason=state.escalation_reason)
 
     async def _listen(self, state: ConversationState) -> str:
         """Получает реплику клиента.
@@ -254,22 +274,25 @@ class Orchestrator:
 
     async def _say(self, state: ConversationState, text: str) -> None:
         """Синтезирует речь и отправляет клиенту."""
-        logger.info("agent_says", call_id=state.call_id, text=text)
+        logger.debug("agent_says", text=text)
 
-        # 1. TTS
         async def audio_stream() -> Any:
             async for chunk in self.tts.synthesize_stream(
                 text, language=state.language, sample_rate=self.settings.sample_rate
             ):
                 yield chunk
 
-        # 2. Отправляем в звонок
         await self.telephony.send_audio(state.call_id, audio_stream())
-        # Также отправляем текстом (для провайдеров с встроенным TTS)
         try:
             await self.telephony.send_text(state.call_id, text)
         except NotImplementedError:
             pass
+
+    async def _say_safe(self, state: ConversationState, text: str) -> None:
+        try:
+            await self._say(state, text)
+        except Exception:
+            logger.warning("say_failed", exc_info=True)
 
     def _tool_executor(self, state: ConversationState) -> ToolExecutor:
         """Замыкание над state — передаётся LLM-агенту как execute_tool."""
@@ -313,12 +336,16 @@ class Orchestrator:
                     client_name=arguments.get("client_name"),
                 )
                 booking = await self.booking.create_booking(req)
-                # Сохраняем результат в state
                 state.slot = booking.slot
                 state.service = booking.service
                 state.master = booking.master
                 state.step = ConversationStep.CONFIRMATION
                 return {"success": True, "booking_id": booking.id, "when": booking.slot.start_at.isoformat()}
+
+            if name == "escalate_to_human":
+                state.step = ConversationStep.ESCALATE
+                state.escalation_reason = str(arguments.get("reason") or "unspecified")
+                return {"success": True, "message": "Transferring to a human administrator."}
 
             msg = f"Unknown tool: {name}"
             return {"error": msg}
@@ -356,4 +383,4 @@ async def build_orchestrator() -> Orchestrator:
     )
 
 
-__all__ = ["Orchestrator", "build_orchestrator"]
+__all__ = ["DuplicateCallbackError", "Orchestrator", "build_orchestrator"]

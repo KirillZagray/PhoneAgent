@@ -97,11 +97,15 @@ uv run python -m phoneagent.main
 # в другом терминале — текстовый диалог с FSM (тот же путь, что и голосовой звонок,
 # только без telephony/STT/TTS):
 curl -X POST http://localhost:8000/call/text -H "Content-Type: application/json" \
-  -d '{"text":"Здравствуйте"}'
+  -d '{"text":"Здравствуйте","phone":"+79991234567"}'
 # ответ содержит call_id — передавайте его дальше, чтобы продолжить тот же диалог:
 curl -X POST http://localhost:8000/call/text -H "Content-Type: application/json" \
   -d '{"text":"Хочу стрижку","call_id":"<call_id из прошлого ответа>"}'
+# сказать «позовите администратора» → step: escalate, диалог завершён
 ```
+
+Номер (E.164) обязателен при старте диалога: агент исходит из того, что телефон
+клиента известен, и никогда его не спрашивает.
 
 `POST /call/request-callback` (реальный дозвон) намеренно откажет с 400, пока
 `TELEPHONY_PROVIDER` не `mock` — реалтайм-аудио стриминг для Voximplant/Twilio/Asterisk
@@ -207,19 +211,36 @@ endpoints:
 
 ## 🔒 Безопасность
 
-`/call/*` и `/webhooks/*` без настройки открыты всем — годится только для локальной
-разработки. Перед деплоем задайте в `.env`:
-
-- `API_AUTH_TOKEN` — сайт салона шлёт его как `Authorization: Bearer <token>`
-  в `/call/request-callback` и `/call/text`.
+- `API_AUTH_TOKEN` — бэкенд сайта салона шлёт его как `Authorization: Bearer <token>`
+  в `/call/request-callback`, `/call/text` и `/admin/config`. **Server-to-server**:
+  в браузерный JS токен класть нельзя.
 - `WEBHOOK_SECRET` — провайдер (или ваш прокси перед ним) должен слать заголовок
   `X-Webhook-Secret` с этим значением на `/webhooks/*`.
+- В `APP_ENV=production` приложение **не стартует** без обоих значений (fail-closed).
+  В `development` пустые значения = проверка отключена.
+- Повторный «Перезвонить» на тот же номер в течение `CALLBACK_DEDUPE_SECONDS` → `409`
+  (двойной клик, спам). Rate-limit по IP — на reverse-proxy (nginx `limit_req`).
+- Номера телефонов в логах маскируются (`+7999***4567`), тексты реплик и полные
+  payload'ы вебхуков — только на `LOG_LEVEL=DEBUG` (152-ФЗ).
+- `/docs` и `/redoc` (Swagger) отключены везде, кроме `development`.
 
-Это общий shared-secret, а не честная per-provider проверка подписи (Twilio своя
-HMAC-схема, у Voximplant/Asterisk — своя). Апгрейд на нативную проверку подписи —
-следующий шаг, когда появится реальная интеграция с конкретным провайдером.
+Проверка вебхуков — общий shared-secret, а не per-provider подпись (Twilio своя
+HMAC-схема, у Voximplant/Asterisk — своя). Апгрейд — вместе с реальным провайдером.
 
-`/docs` и `/redoc` (Swagger) отключены везде, кроме `APP_ENV=development`.
+## 🏢 Один деплой = один салон (v1)
+
+`salon_id` в API принимается и сохраняется в состоянии, но **ничего не выбирает**:
+booking-коннектор, промпт, название и часы работы — глобальные из `.env`
+(`SALON_NAME`, `SALON_TIMEZONE`, `SALON_WORKING_HOURS`, `BOOKING_API_URL`).
+Несколько салонов = несколько инстансов. Мульти-тенантность (конфиг салонов,
+per-salon коннектор) — отдельный этап, поле в API оставлено ради совместимости.
+
+## 🔊 Аудио-контракт
+
+Между TTS и телефонией ходит **сырой PCM 16-bit mono `SAMPLE_RATE`** (8000 Hz —
+телефонная линия). Каждый TTS-провайдер приводит свой выход к этому сам:
+VoiceStudio — WAV→PCM+ресемплинг, ElevenLabs — просит `pcm_8000` у API,
+Edge TTS — MP3→PCM через `ffmpeg`. Телефония получает байты как есть.
 
 ## 🛣 Roadmap
 
@@ -234,9 +255,12 @@ HMAC-схема, у Voximplant/Asterisk — своя). Апгрейд на на�
 | 6 | GenericAPI booking connector | ✅ |
 | 7 | YClients / Dikidi / Altegio адаптеры | ⏳ |
 | 8 | Twilio / Asterisk — реалтайм send_audio (WS/Media Streams) | ⏳ |
-| 9 | Production hardening: auth на /call и /webhooks, CI, retries (generic_api) | ✅ |
+| 9 | Production hardening: auth (fail-closed), дедуп, таймауты LLM/звонка, CI, retries | ✅ |
+| 9b | Промпт с датой/часами работы, эскалация на человека, аудио-контракт TTS | ✅ |
 | 10 | Per-provider проверка подписи вебхуков (Twilio HMAC и т.д.) | ⏳ |
-| 11 | Langfuse / observability | ⏳ |
+| 11 | LLM→TTS стриминг по предложениям (латентность в живом звонке) | ⏳ |
+| 12 | Мульти-тенантность (несколько салонов на один инстанс) | ⏳ |
+| 13 | Langfuse / observability | ⏳ |
 
 Статусы 2/8 (реальная телефония) намеренно заблокированы на уровне кода:
 `Orchestrator.handle_callback` отказывает с ошибкой, если у провайдера

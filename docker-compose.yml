@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   phoneagent:
     build:
@@ -9,23 +7,23 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    env_file:
+      - .env
+    # environment: имеет приоритет над env_file — эти значения нельзя случайно
+    # перебить .env'ом (например, STATE_STORE=memory из .env.example).
     environment:
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STATE_STORE: redis
       REDIS_URL: redis://redis:6379/0
       TELEPHONY_PROVIDER: ${TELEPHONY_PROVIDER:-mock}
       STT_PROVIDER: ${STT_PROVIDER:-mock}
       TTS_PROVIDER: ${TTS_PROVIDER:-mock}
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
       BOOKING_CONNECTOR: ${BOOKING_CONNECTOR:-mock}
-      # Раскомментируйте для реальных провайдеров:
-      # VOXIMPLANT_ACCOUNT_ID: ${VOXIMPLANT_ACCOUNT_ID}
-      # VOXIMPLANT_API_KEY: ${VOXIMPLANT_API_KEY}
-      # VOXIMPLANT_RULE_ID: ${VOXIMPLANT_RULE_ID}
-      # OPENAI_API_KEY: ${OPENAI_API_KEY}
-      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-    env_file:
-      - .env
+      # В production контейнер не стартует без этих двух (см. main.lifespan):
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -36,8 +34,8 @@ services:
     image: redis:7-alpine
     container_name: phoneagent-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    # Наружу не публикуем: доступ только внутри compose-сети. Для отладки с хоста —
+    # `docker exec -it phoneagent-redis redis-cli`.
     volumes:
       - redis-data:/data
     healthcheck:

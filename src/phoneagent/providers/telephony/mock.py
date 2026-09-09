@@ -14,7 +14,7 @@ from typing import Any
 
 from phoneagent.models.call import CallEvent, CallRef, CallStatus, CallStatusEnum
 from phoneagent.providers.telephony.base import BaseTelephonyProvider
-from phoneagent.utils import get_logger
+from phoneagent.utils import get_logger, mask_phone
 
 logger = get_logger(__name__)
 
@@ -62,7 +62,7 @@ class MockTelephonyProvider(BaseTelephonyProvider):
         ref.status = CallStatusEnum.CONNECTED
         await self._events.put(CallEvent(event_type="connected", call_id=call_id))
 
-        logger.info("mock_call_connected", call_id=call_id, phone=to_phone)
+        logger.info("mock_call_connected", call_id=call_id, phone=mask_phone(to_phone))
         return ref
 
     async def hangup(self, call_id: str) -> None:

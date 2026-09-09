@@ -9,7 +9,10 @@ from collections.abc import AsyncIterator
 class BaseTTSProvider(ABC):
     """Базовая абстракция для синтеза речи.
 
-    Принимает текст, выдаёт аудио-поток в нужном формате (по умолчанию PCM 16-bit 8kHz).
+    Контракт выхода (и synthesize, и synthesize_stream): сырой PCM 16-bit signed
+    little-endian, моно, ровно на запрошенном `sample_rate`. Без WAV-заголовка,
+    без MP3. Всё, что провайдер отдаёт в другом виде, он конвертирует сам
+    (см. utils/audio.py) — телефония получает байты как есть.
     """
 
     name: str = "base"

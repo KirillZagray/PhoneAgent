@@ -23,7 +23,7 @@ import httpx
 from phoneagent.config import get_settings
 from phoneagent.models.call import CallEvent, CallRef, CallStatus, CallStatusEnum
 from phoneagent.providers.telephony.base import BaseTelephonyProvider
-from phoneagent.utils import get_logger
+from phoneagent.utils import get_logger, mask_phone
 
 logger = get_logger(__name__)
 
@@ -95,9 +95,12 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
                 json.dumps({"webhook_url": webhook_url, "scenario_id": scenario_id}).encode()
             ).decode(),
         )
-        call_id = str(result.get("call_id", ""))
+        # Platform API отвечает call_session_history_id, не call_id.
+        # TODO(этап 2): сверить с https://voximplant.com/docs/references/httpapi/StartCall
+        # и способ остановки звонка (StopCall vs управление из VoxEngine-сценария).
+        call_id = str(result.get("call_session_history_id") or result.get("call_id") or "")
         if not call_id:
-            msg = f"Voximplant StartCall returned no call_id: {result}"
+            msg = f"Voximplant StartCall returned no call id: {list(result)}"
             raise RuntimeError(msg)
 
         ref = CallRef(
@@ -107,7 +110,7 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
             status=CallStatusEnum.INITIATED,
             metadata={"rule_id": rule_id, "scenario_id": scenario_id},
         )
-        logger.info("voximplant_call_initiated", call_id=call_id, phone=to_phone)
+        logger.info("voximplant_call_initiated", call_id=call_id, phone=mask_phone(to_phone))
         return ref
 
     async def hangup(self, call_id: str) -> None:

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from phoneagent.api.security import require_api_token
 from phoneagent.config import get_settings
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -15,7 +16,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "phoneagent"}
 
 
-@router.get("/config", summary="Текущая конфигурация (без секретов)")
+@router.get(
+    "/config",
+    summary="Текущая конфигурация (без секретов)",
+    dependencies=[Depends(require_api_token)],
+)
 async def config() -> dict[str, str]:
     """Возвращает активную конфигурацию (провайдеры, без API-ключей)."""
     settings = get_settings()

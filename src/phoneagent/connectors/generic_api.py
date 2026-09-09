@@ -250,7 +250,7 @@ class GenericAPIBookingConnector(BaseBookingConnector):
 
 def build_generic_connector_from_yaml(yaml_path: str) -> GenericAPIBookingConnector:
     """Загружает конфиг эндпоинтов из YAML и создаёт коннектор."""
-    import yaml  # type: ignore
+    import yaml
     with open(yaml_path) as f:
         config = yaml.safe_load(f)
     return GenericAPIBookingConnector(config=config)

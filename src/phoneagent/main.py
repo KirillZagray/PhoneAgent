@@ -22,6 +22,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Lifespan-обработчик FastAPI: поднимает один общий orchestrator на всё приложение."""
     settings = get_settings()
     configure_logging()
+    if settings.app_env == Environment.PRODUCTION:
+        missing = [
+            name
+            for name, value in (("API_AUTH_TOKEN", settings.api_auth_token), ("WEBHOOK_SECRET", settings.webhook_secret))
+            if not value
+        ]
+        if missing:
+            # fail-closed: в проде открытые /call и /webhooks = чужие звонки за ваш счёт
+            msg = f"APP_ENV=production requires {', '.join(missing)} to be set"
+            raise RuntimeError(msg)
     logger.info(
         "phoneagent_starting",
         version=__version__,

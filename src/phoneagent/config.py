@@ -114,27 +114,39 @@ class PhoneAgentSettings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-haiku-4-5"
     openai_model: str = "gpt-5.4-mini"
+    # В живом звонке зависший LLM = тишина в трубке. Дефолт SDK — 10 минут.
+    llm_timeout_seconds: float = 15.0
+    # Сколько последних реплик отдавать модели (звонок короткий, но кап нужен).
+    max_history_messages: int = 40
 
-    # ── Booking ─────────────────────────────────────────
+    # ── Booking / салон ───────────────────────────────────
+    # v1 — один деплой = один салон. salon_id в API принимается, но ничего не выбирает.
     booking_connector: BookingConnector = BookingConnector.MOCK
     booking_api_url: str = ""
     booking_api_token: str = ""
     salon_id: str = "demo"
+    salon_name: str = "салон красоты"
+    salon_timezone: str = "Europe/Moscow"
+    salon_working_hours: str = "10:00-20:00"
 
     # ── Voice Pipeline ──────────────────────────────────
     sample_rate: int = 8000
-    audio_channels: int = 1
-    audio_format: Literal["ulaw", "wav", "opus", "pcm"] = "ulaw"
 
     # ── Conversation ─────────────────────────────────────
     default_language: str = "ru"
+    # Жёсткий потолок длительности одного звонка — цикл диалога прерывается по нему.
     call_timeout_seconds: int = 300
     max_retries: int = 3
+    # TTL состояния диалога в хранилище.
+    state_ttl_seconds: int = 3600
+    # Повторный «Перезвонить» на тот же номер в это окно игнорируется (двойной клик, спам).
+    callback_dedupe_seconds: int = 120
 
     # ── Security ──────────────────────────────────────────
-    # Bearer-токен для /call/*. Пусто = эндпоинт открыт (только для локальной разработки).
+    # Bearer-токен для /call/* и /admin/config. Пусто = открыто (только локальная разработка;
+    # в APP_ENV=production пустой токен — отказ запуска).
     api_auth_token: str = ""
-    # Общий секрет для входящих /webhooks/*. Пусто = проверка отключена (dev).
+    # Общий секрет для входящих /webhooks/*. Та же политика, что и у api_auth_token.
     webhook_secret: str = ""
 
 

@@ -29,7 +29,11 @@ class WhisperAPIProvider(BaseSTTProvider):
         if not self.settings.openai_api_key:
             msg = "OPENAI_API_KEY not set for Whisper"
             raise RuntimeError(msg)
-        self._client = AsyncOpenAI(api_key=self.settings.openai_api_key)
+        self._client = AsyncOpenAI(
+            api_key=self.settings.openai_api_key,
+            timeout=self.settings.llm_timeout_seconds,
+            max_retries=1,
+        )
         logger.info("whisper_api_connected")
 
     async def disconnect(self) -> None:
@@ -75,7 +79,7 @@ class WhisperAPIProvider(BaseSTTProvider):
             language=language,
         )
         text = response.text
-        logger.info("whisper_transcribed", text=text[:80])
+        logger.debug("whisper_transcribed", text=text[:80])
         return text
 
     async def transcribe_stream(
@@ -105,7 +109,7 @@ class FasterWhisperProvider(BaseSTTProvider):
         self._model: Any = None
 
     async def connect(self) -> None:
-        from faster_whisper import WhisperModel  # type: ignore
+        from faster_whisper import WhisperModel
 
         self._model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
         logger.info("faster_whisper_loaded", model=self.model_size, device=self.device)
