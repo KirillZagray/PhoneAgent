@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  phoneagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phoneagent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
+      TELEPHONY_PROVIDER: ${TELEPHONY_PROVIDER:-mock}
+      STT_PROVIDER: ${STT_PROVIDER:-mock}
+      TTS_PROVIDER: ${TTS_PROVIDER:-mock}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      BOOKING_CONNECTOR: ${BOOKING_CONNECTOR:-mock}
+      # Раскомментируйте для реальных провайдеров:
+      # VOXIMPLANT_ACCOUNT_ID: ${VOXIMPLANT_ACCOUNT_ID}
+      # VOXIMPLANT_API_KEY: ${VOXIMPLANT_API_KEY}
+      # VOXIMPLANT_RULE_ID: ${VOXIMPLANT_RULE_ID}
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - phoneagent-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: phoneagent-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - phoneagent-net
+
+volumes:
+  redis-data:
+
+networks:
+  phoneagent-net:
+    driver: bridge
