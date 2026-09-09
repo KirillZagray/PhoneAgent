@@ -19,6 +19,7 @@ from phoneagent.models.conversation import ConversationState
 from phoneagent.providers.stt.voicestudio import VoiceStudioSTTProvider
 from phoneagent.providers.telephony.mock import MockTelephonyProvider
 from phoneagent.providers.telephony.twilio import TwilioTelephonyProvider
+from phoneagent.providers.telephony.voximplant import VoximplantTelephonyProvider
 from phoneagent.providers.tts.voicestudio import VoiceStudioTTSProvider
 from phoneagent.utils.audio import pcm_to_wav
 
@@ -323,3 +324,74 @@ def test_webhook_requires_secret_when_configured(monkeypatch: pytest.MonkeyPatch
         )
         assert resp_ok.status_code == 200
     get_settings.cache_clear()
+
+
+# ── Voximplant: реальный Management API (StartScenarios, не выдуманный StartCall) ──
+
+
+@pytest.mark.asyncio
+async def test_voximplant_make_call_uses_start_scenarios_with_pipe_custom_data():
+    provider = VoximplantTelephonyProvider()
+    provider.settings = provider.settings.model_copy(
+        update={"voximplant_account_id": "1", "voximplant_api_key": "k", "voximplant_rule_id": "5"}
+    )
+    sent_data: dict = {}
+
+    async with respx.mock(base_url="https://api.voximplant.com/platform_api") as mock:
+        def capture(request: httpx.Request) -> httpx.Response:
+            from urllib.parse import parse_qsl
+
+            sent_data.update(dict(parse_qsl(request.content.decode())))
+            return httpx.Response(
+                200,
+                json={
+                    "result": 1,
+                    "call_session_history_id": 12345,
+                    "media_session_access_secure_url": "https://example.com/manage/abc",
+                },
+            )
+
+        mock.post("/StartScenarios").mock(side_effect=capture)
+
+        await provider.connect()
+        try:
+            ref = await provider.make_call("+79991234567")
+        finally:
+            await provider.disconnect()
+
+    assert sent_data["rule_id"] == "5"
+    # customData — "call_id|phone", НЕ json/base64 (лимит 200 байт у VoxEngine.customData()).
+    call_id, phone = sent_data["script_custom_data"].split("|")
+    assert phone == "+79991234567"
+    assert ref.call_id == call_id
+    assert ref.metadata["voximplant_session_id"] == "12345"
+
+
+@pytest.mark.asyncio
+async def test_voximplant_hangup_calls_media_session_access_url():
+    provider = VoximplantTelephonyProvider()
+    provider.settings = provider.settings.model_copy(
+        update={"voximplant_account_id": "1", "voximplant_api_key": "k", "voximplant_rule_id": "5"}
+    )
+
+    async with respx.mock() as mock:
+        mock.post("https://api.voximplant.com/platform_api/StartScenarios").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "result": 1,
+                    "call_session_history_id": 1,
+                    "media_session_access_secure_url": "https://vx.example/manage/xyz",
+                },
+            )
+        )
+        manage_route = mock.get("https://vx.example/manage/xyz").mock(return_value=httpx.Response(200))
+
+        await provider.connect()
+        try:
+            ref = await provider.make_call("+79991234567")
+            await provider.hangup(ref.call_id)
+        finally:
+            await provider.disconnect()
+
+    assert manage_route.called

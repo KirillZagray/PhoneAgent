@@ -18,8 +18,11 @@ from fastapi import Header, HTTPException, status
 from phoneagent.config import get_settings
 
 
-def _matches(provided: str | None, expected: str) -> bool:
-    # bytes — compare_digest на str падает TypeError на не-ASCII (→ 500 вместо 401)
+def secret_matches(provided: str | None, expected: str) -> bool:
+    """Constant-time сравнение секретов. bytes — compare_digest на str падает
+    TypeError на не-ASCII (→ 500 вместо 401/4401). Публичная — используется и
+    HTTP-зависимостями ниже, и WS-роутом моста (api/media_ws.py), у которого
+    нет Depends() на HTTP-заголовки."""
     return hmac.compare_digest((provided or "").encode(), expected.encode())
 
 
@@ -33,7 +36,7 @@ async def require_api_token(authorization: str | None = Header(default=None)) ->
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:]
 
-    if not _matches(token, expected):
+    if not secret_matches(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API token",
@@ -46,11 +49,11 @@ async def require_webhook_secret(x_webhook_secret: str | None = Header(default=N
     if not expected:
         return
 
-    if not _matches(x_webhook_secret, expected):
+    if not secret_matches(x_webhook_secret, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing webhook secret",
         )
 
 
-__all__ = ["require_api_token", "require_webhook_secret"]
+__all__ = ["require_api_token", "require_webhook_secret", "secret_matches"]

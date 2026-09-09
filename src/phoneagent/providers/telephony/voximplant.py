@@ -1,21 +1,35 @@
 """Voximplant — российский провайдер телефонии.
 
-Реализует BaseTelephonyProvider через Voximplant HTTP API + VoxEngine Scenario.
+Реализует BaseTelephonyProvider через Voximplant Management API + VoxEngine Scenario.
 
-Документация: https://voximplant.com/docs/
+Всё ниже сверено с https://voximplant.com/docs/ вживую (2026-09-09), а не по
+памяти — предыдущая версия этого файла вызывала несуществующий метод
+`StartCall`. Реальный механизм:
 
-Для стриминга аудио используется Voximplant Audio Streaming API:
-https://voximplant.com/docs/references/voxengine/audiostreaming
+1. Мы вызываем `StartScenarios` (не `StartCall` — такого метода нет). У него
+   нет параметра `phone`: он просто запускает JS-сценарий в новой медиа-сессии,
+   привязанной к `rule_id`. Номер для дозвона сценарий берёт из
+   `script_custom_data` и сам вызывает `VoxEngine.callPSTN(number, callerId)`.
+2. `script_custom_data` ограничен 200 байтами и читается в сценарии как
+   `VoxEngine.customData()` — просто строка `"{call_id}|{phone}"`, без JSON.
+   `call_id` минтим сами (uuid), ДО вызова: он нужен сценарию, чтобы открыть
+   `wss://.../ws/voxengine/{call_id}` (аудио-мост, см.
+   docs/superpowers/specs/2026-09-09-voximplant-audio-bridge-design.md).
+3. Ответ `StartScenarios` возвращает `call_session_history_id` (для
+   `GetCallHistory`) и `media_session_access_secure_url` — единственный способ
+   остановить сессию извне: HTTP-запрос на этот URL триггерит в сценарии
+   событие `AppEvents.HttpRequest`, на которое сценарий должен сам повесить
+   `call.hangup()`. Отдельного `StopCall` метода не существует.
 
-Заготовка: реализация методов будет добавлена по мере необходимости.
-Полноценный код появится после этапа 2 (MVP с реальными звонками).
+Оба этих значения — внутренние для Voximplant, наружу (в CallRef, Orchestrator,
+state_store) утекает только наш `call_id`.
 """
 
 from __future__ import annotations
 
-import base64
-import json
+import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -30,6 +44,12 @@ logger = get_logger(__name__)
 VOXIMPLANT_API_URL = "https://api.voximplant.com/platform_api"
 
 
+@dataclass
+class _Session:
+    call_session_history_id: str
+    media_session_access_secure_url: str
+
+
 class VoximplantTelephonyProvider(BaseTelephonyProvider):
     """Провайдер телефонии Voximplant."""
 
@@ -38,12 +58,13 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
     def __init__(self) -> None:
         self.settings = get_settings()
         self._client: httpx.AsyncClient | None = None
+        self._sessions: dict[str, _Session] = {}  # наш call_id -> данные сессии Voximplant
 
     async def connect(self) -> None:
         if not self.settings.voximplant_account_id or not self.settings.voximplant_api_key:
             msg = "Voximplant credentials not configured (VOXIMPLANT_ACCOUNT_ID, VOXIMPLANT_API_KEY)"
             raise RuntimeError(msg)
-        self._client = httpx.AsyncClient(base_url=VOXIMPLANT_API_URL, timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=30.0)
         logger.info("voximplant_connected")
 
     async def disconnect(self) -> None:
@@ -52,25 +73,17 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
         logger.info("voximplant_disconnected")
 
     async def _call_api(self, method: str, **params: Any) -> dict[str, Any]:
-        """Вызов метода Voximplant API.
-
-        Используется JSON API: POST /platform_api/{method}
-        Auth: account_id + api_key в query params.
-        """
+        """Вызов метода Voximplant Management API: POST /platform_api/{Method}."""
         if self._client is None:
             msg = "Voximplant client not connected"
             raise RuntimeError(msg)
 
-        # Voximplant принимает multipart/form-data для JSON API
         params = {
             "account_id": self.settings.voximplant_account_id,
             "api_key": self.settings.voximplant_api_key,
             **params,
         }
-        response = await self._client.post(
-            f"/{method}",
-            data=params,
-        )
+        response = await self._client.post(f"{VOXIMPLANT_API_URL}/{method}", data=params)
         response.raise_for_status()
         result = response.json()
         if result.get("error"):
@@ -79,54 +92,64 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
         return result  # type: ignore[no-any-return]
 
     async def make_call(self, to_phone: str, **kwargs: Any) -> CallRef:
-        """Инициирует звонок через Voximplant StartCall.
+        """Запускает VoxEngine-сценарий через StartScenarios.
 
-        https://voximplant.com/docs/references/httpapi/StartCall
+        Сам дозвон делает сценарий (`VoxEngine.callPSTN`), не эта функция —
+        см. докстринг модуля.
         """
         rule_id = kwargs.get("rule_id") or self.settings.voximplant_rule_id
-        scenario_id = kwargs.get("scenario_id") or self.settings.voximplant_scenario_id
-        webhook_url = kwargs.get("webhook_url")
 
+        call_id = uuid.uuid4().hex
         result = await self._call_api(
-            "StartCall",
+            "StartScenarios",
             rule_id=rule_id,
-            phone=to_phone,
-            script_custom_data=base64.b64encode(
-                json.dumps({"webhook_url": webhook_url, "scenario_id": scenario_id}).encode()
-            ).decode(),
+            script_custom_data=f"{call_id}|{to_phone}",
         )
-        # Platform API отвечает call_session_history_id, не call_id.
-        # TODO(этап 2): сверить с https://voximplant.com/docs/references/httpapi/StartCall
-        # и способ остановки звонка (StopCall vs управление из VoxEngine-сценария).
-        call_id = str(result.get("call_session_history_id") or result.get("call_id") or "")
-        if not call_id:
-            msg = f"Voximplant StartCall returned no call id: {list(result)}"
+        session_history_id = str(result.get("call_session_history_id") or "")
+        access_url = str(result.get("media_session_access_secure_url") or "")
+        if not session_history_id or not access_url:
+            msg = f"Voximplant StartScenarios returned incomplete response: {list(result)}"
             raise RuntimeError(msg)
+        self._sessions[call_id] = _Session(session_history_id, access_url)
 
         ref = CallRef(
             call_id=call_id,
             provider=self.name,
             phone=to_phone,
             status=CallStatusEnum.INITIATED,
-            metadata={"rule_id": rule_id, "scenario_id": scenario_id},
+            metadata={"rule_id": rule_id, "voximplant_session_id": session_history_id},
         )
         logger.info("voximplant_call_initiated", call_id=call_id, phone=mask_phone(to_phone))
         return ref
 
     async def hangup(self, call_id: str) -> None:
-        """Завершает звонок через StopCall."""
-        await self._call_api("StopCall", call_id=call_id, reason="hangup")
+        """Останавливает сессию через её `media_session_access_secure_url`.
+
+        Реального REST-метода `StopCall` не существует: единственный способ
+        достучаться до запущенного сценария извне — HTTP-запрос на этот URL,
+        который в сценарии приходит как `AppEvents.HttpRequest` (сценарий
+        должен сам на него повесить `call.hangup()`, см. voxengine/*.js).
+        """
+        session = self._sessions.pop(call_id, None)
+        if session is None:
+            logger.warning("voximplant_hangup_unknown_call", call_id=call_id)
+            return
+        if self._client is None:
+            msg = "Voximplant client not connected"
+            raise RuntimeError(msg)
+        await self._client.get(session.media_session_access_secure_url)
         logger.info("voximplant_call_hangup", call_id=call_id)
 
     async def get_status(self, call_id: str) -> CallStatus:
         """Получает статус через GetCallHistory (пока упрощённо)."""
-        result = await self._call_api("GetCallHistory", call_id=call_id)
+        session = self._sessions.get(call_id)
+        session_id = session.call_session_history_id if session else call_id
+        result = await self._call_api("GetCallHistory", call_session_history_id=session_id)
         history = result.get("result", [])
         if not history:
             return CallStatus(call_id=call_id, status=CallStatusEnum.PENDING)
 
         record = history[0]
-        # Voximplant возвращает длительность, флаги и т.п.
         return CallStatus(
             call_id=call_id,
             status=CallStatusEnum.COMPLETED if record.get("duration") else CallStatusEnum.CONNECTED,
@@ -145,15 +168,16 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
             yield
 
     async def send_audio(self, call_id: str, audio: AsyncIterator[bytes]) -> None:
-        """Стриминг аудио в звонок через MediaStream (TTS через VoxEngine).
+        """Аудио идёт через мост `/ws/voxengine/{call_id}` (Phase B), не отсюда.
 
-        Заготовка: реализация потребует интеграции с VoxEngine Scenario
-        и AudioStreaming API.
+        См. docs/superpowers/specs/2026-09-09-voximplant-audio-bridge-design.md —
+        открытый вопрос №3: остаётся ли `_say()`/`send_audio` единым путём
+        вывода звука, или мост пишет в WS напрямую. Пока не Phase B — не реализовано.
         """
-        msg = "send_audio: реализуется через VoxEngine Scenario + MediaStream"
+        msg = "send_audio: реализуется в Phase B аудио-моста (см. spec)"
         raise NotImplementedError(msg)
 
     async def send_text(self, call_id: str, text: str) -> None:
-        """Если VoxEngine Scenario использует встроенный TTS (SpeechKit и т.п.)."""
-        msg = "send_text: реализуется через VoxEngine Scenario + встроенный TTS"
+        """Не используется — TTS всегда наш пайплайн, не встроенный SpeechKit."""
+        msg = "send_text: не применяется, TTS идёт через send_audio/аудио-мост"
         raise NotImplementedError(msg)

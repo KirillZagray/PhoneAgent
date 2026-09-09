@@ -1,7 +1,43 @@
 # Voximplant audio bridge — design
 
 Date: 2026-09-09
-Status: approved for planning
+Status: Phase A implemented (see "Implementation notes" below), pending real-call verification
+
+## Implementation notes (2026-09-09, during Phase A build)
+
+Further doc verification while implementing surfaced that the *existing*
+`VoximplantTelephonyProvider.make_call`/`hangup` (written before this spec)
+called a Management API method, `StartCall`, that does not exist. Fixed as
+part of Phase A, not deferred:
+
+- The real method is `StartScenarios`. It has no `phone` parameter — it only
+  starts a JS scenario in a new media session bound to `rule_id`. The scenario
+  itself must call `VoxEngine.callPSTN(number, callerId)` to actually dial out.
+- `script_custom_data` is capped at 200 bytes and is a plain string (not JSON)
+  read back via `VoxEngine.customData()`. We send `"{call_id}|{phone}"`.
+  `call_id` is minted by us (uuid) *before* calling `StartScenarios`, since the
+  scenario needs it to build the bridge WS URL and `StartScenarios`'s own
+  `call_session_history_id` is only known after the call returns.
+- There is no `StopCall` method either. `StartScenarios` returns
+  `media_session_access_secure_url`; an HTTP request to that URL is what
+  triggers `AppEvents.HttpRequest` in the running scenario, and the platform
+  terminates the session automatically once that request is made. This is now
+  `VoximplantTelephonyProvider.hangup`'s actual mechanism.
+
+This resolves Open question 1 below more thoroughly than originally scoped —
+worth knowing for Phase B that the pre-existing telephony provider code
+should not be trusted at face value without checking against current docs.
+
+`supports_realtime_audio` stays `False` for Voximplant through all of Phase A
+(unchanged) — `send_audio` still raises `NotImplementedError`, and going
+through `Orchestrator.handle_callback`/`_process_call` would hang up the call
+within milliseconds of connecting (the greeting's `_say()` call hits that
+`NotImplementedError`, which the existing outer try/except treats as a call
+failure and hangs up). Phase A validation therefore calls `StartScenarios`
+directly against the Voximplant API, bypassing the Orchestrator entirely — see
+[docs/deploy-voximplant-bridge.md](../../deploy-voximplant-bridge.md) step 4.
+This is intentional and correct: the safety gate keeps doing its job for the
+real entry point, and flipping it to `True` is exactly the Phase B change.
 
 ## Context
 

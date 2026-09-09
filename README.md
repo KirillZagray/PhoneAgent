@@ -247,7 +247,8 @@ Edge TTS — MP3→PCM через `ffmpeg`. Телефония получает 
 | # | Этап | Статус |
 |---|------|--------|
 | 1 | Скелет + mock-провайдеры + FSM | ✅ |
-| 2 | Voximplant + WebSocket-стриминг | ⏳ |
+| 2a | Voximplant: аудио-мост Phase A (echo, `/ws/voxengine/{call_id}`) | ✅ (нужна проверка реальным звонком — [деплой-инструкция](docs/deploy-voximplant-bridge.md)) |
+| 2b | Voximplant: Phase B (реальные STT/LLM/TTS в мосте) | ⏳ |
 | 3 | Edge TTS + VoiceStudio провайдеры (TTS) | ✅ |
 | 3b | VoiceStudio STT (Whisper через тот же сервер) | ✅ |
 | 4 | Whisper STT — OpenAI API / faster-whisper локально | ✅ |

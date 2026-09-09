@@ -80,10 +80,11 @@ class PhoneAgentSettings(BaseSettings):
     public_webhook_base_url: HttpUrl = Field(default="http://localhost:8000")  # type: ignore[assignment]
 
     # Voximplant
+    # Сценарий привязывается к номеру через Rule в кабинете Voximplant, а не
+    # передаётся per-call — отдельной настройки для scenario_id не нужно.
     voximplant_account_id: str = ""
     voximplant_api_key: str = ""
     voximplant_rule_id: str = ""
-    voximplant_scenario_id: str = ""
 
     # Twilio
     twilio_account_sid: str = ""

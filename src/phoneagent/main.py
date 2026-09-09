@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from phoneagent import __version__
-from phoneagent.api import admin_router, trigger_router, webhooks_router
+from phoneagent.api import admin_router, media_ws_router, trigger_router, webhooks_router
 from phoneagent.config import Environment, get_settings
 from phoneagent.core.orchestrator import build_orchestrator
 from phoneagent.utils import configure_logging, get_logger
@@ -66,6 +66,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
     app.include_router(trigger_router)
     app.include_router(webhooks_router)
+    app.include_router(media_ws_router)
 
     return app
 

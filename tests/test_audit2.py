@@ -12,7 +12,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from phoneagent.api.security import _matches
+from phoneagent.api.security import secret_matches
 from phoneagent.config import get_settings
 from phoneagent.connectors.mock import MockBookingConnector
 from phoneagent.core import state_store as state_store_module
@@ -200,10 +200,10 @@ def test_mask_phone_and_redact_url() -> None:
     assert redact_url("redis://host:6379/0") == "redis://host:6379/0"
 
 
-def test_matches_non_ascii_does_not_raise() -> None:
-    assert _matches("сёкрет", "secret") is False
-    assert _matches("secret", "secret") is True
-    assert _matches(None, "secret") is False
+def test_secret_matches_non_ascii_does_not_raise() -> None:
+    assert secret_matches("сёкрет", "secret") is False
+    assert secret_matches("secret", "secret") is True
+    assert secret_matches(None, "secret") is False
 
 
 # ── FastAPI app ─────────────────────────────────────────
