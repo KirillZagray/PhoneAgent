@@ -92,9 +92,24 @@ class PhoneAgentSettings(BaseSettings):
     twilio_caller_id: str = ""
 
     # Asterisk
+    # ARI (control plane) — connect() в AsteriskTelephonyProvider падает,
+    # если host/username пустые.
     asterisk_host: str = ""
+    asterisk_ari_port: int = 8088
     asterisk_ari_username: str = ""
     asterisk_ari_password: str = ""
+    # Имя Stasis-приложения — то же значение должно быть в ARI events
+    # WS-подписке и в `app=` параметре Originate (make_call).
+    asterisk_stasis_app: str = "phoneagent_bridge"
+    # Имя PJSIP-эндпоинта (SIP-транк), через который make_call набирает номер
+    # по умолчанию — см. asterisk_conf/pjsip.conf.
+    asterisk_trunk_endpoint: str = "mts_exolve"
+    # Caller ID для исходящих через транк. Пусто = транк подставит свой дефолтный.
+    asterisk_caller_id: str = ""
+    # Порт, на котором PhoneAgent слушает AudioSocket-мост (Asterisk
+    # подключается к нему из dialplan, см. asterisk_conf/extensions.conf).
+    # Хост для bind всегда 0.0.0.0 — задаётся прямо в main.py, не отсюда.
+    asterisk_audiosocket_port: int = 40122
 
     # ── STT ─────────────────────────────────────────────
     stt_provider: STTProvider = STTProvider.MOCK
@@ -117,8 +132,20 @@ class PhoneAgentSettings(BaseSettings):
     openai_model: str = "gpt-5.4-mini"
     # В живом звонке зависший LLM = тишина в трубке. Дефолт SDK — 10 минут.
     llm_timeout_seconds: float = 15.0
+    # Мягкий таймаут: если модель не ответила за это время — агент говорит
+    # филлер-фразу ("секунду, уточняю...") и продолжает ждать настоящий
+    # ответ (запрос не отменяется). Жёсткий обрыв — llm_timeout_seconds
+    # выше, это таймаут самого HTTP-клиента SDK.
+    llm_soft_timeout_seconds: float = 4.0
     # Сколько последних реплик отдавать модели (звонок короткий, но кап нужен).
     max_history_messages: int = 40
+
+    # ── Voice Pipeline: защита от эха ──────────────────────
+    # Пауза после того, как TTS агента реально ушёл в линию (см.
+    # AudioSession.wait_drained), прежде чем начинать слушать клиента.
+    # Снижает шанс, что VAD примет хвост эха/реверберации собственного
+    # голоса агента на линии за реплику клиента.
+    echo_guard_seconds: float = 0.3
 
     # ── Booking / салон ───────────────────────────────────
     # v1 — один деплой = один салон. salon_id в API принимается, но ничего не выбирает.
@@ -132,6 +159,22 @@ class PhoneAgentSettings(BaseSettings):
 
     # ── Voice Pipeline ──────────────────────────────────
     sample_rate: int = 8000
+    # Размер кадра исходящего аудио к телефонии (см. core/audio_session.paced_frames).
+    audio_frame_ms: int = 20
+
+    # ── VAD (Phase B — определение конца реплики клиента) ────
+    # ponytail: наивный RMS-порог по амплитуде PCM, не webrtcvad/silero —
+    # достаточно для проверки живого пайплайна; апгрейд, если на шумных
+    # линиях (плохой GSM) начнёт резать речь слишком рано/поздно.
+    vad_energy_threshold: int = 400
+    # Сколько ждём, пока клиент вообще начнёт говорить, прежде чем сдаться
+    # (ведёт в retry-логику _dialog_loop — "Алло, вы меня слышите?").
+    vad_initial_silence_seconds: float = 5.0
+    # Пауза такой длины после начала речи считается концом реплики.
+    vad_silence_seconds: float = 1.2
+    # Жёсткий потолок одной реплики — не даёт одному длинному монологу
+    # съесть весь call_timeout_seconds.
+    vad_max_utterance_seconds: float = 20.0
 
     # ── Conversation ─────────────────────────────────────
     default_language: str = "ru"

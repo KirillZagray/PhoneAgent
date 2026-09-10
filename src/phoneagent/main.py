@@ -10,7 +10,8 @@ from fastapi import FastAPI
 
 from phoneagent import __version__
 from phoneagent.api import admin_router, media_ws_router, trigger_router, webhooks_router
-from phoneagent.config import Environment, get_settings
+from phoneagent.api.audiosocket_server import start_audiosocket_server
+from phoneagent.config import Environment, TelephonyProvider, get_settings
 from phoneagent.core.orchestrator import build_orchestrator
 from phoneagent.utils import configure_logging, get_logger
 
@@ -43,7 +44,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         booking=settings.booking_connector.value,
     )
     app.state.orchestrator = await build_orchestrator()
+
+    # AudioSocket-мост — отдельный TCP-сервер (не HTTP/WS), нужен только когда
+    # Asterisk реально в деле. Держать его поднятым для других провайдеров
+    # смысла нет — лишний открытый порт без потребителя.
+    audiosocket_server = None
+    if settings.telephony_provider == TelephonyProvider.ASTERISK:
+        audiosocket_server = await start_audiosocket_server("0.0.0.0", settings.asterisk_audiosocket_port)
+    app.state.audiosocket_server = audiosocket_server
+
     yield
+
+    if audiosocket_server is not None:
+        audiosocket_server.close()
+        await audiosocket_server.wait_closed()
     await app.state.orchestrator.aclose()
     logger.info("phoneagent_shutting_down")
 

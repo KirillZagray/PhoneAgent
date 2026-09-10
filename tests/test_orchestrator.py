@@ -102,3 +102,46 @@ async def test_mock_llm_agent_service_identification() -> None:
         assert response.tool_calls[0].name == "list_services"
     finally:
         await agent.disconnect()
+
+@pytest.mark.asyncio
+async def test_handle_inbound_call_creates_state_and_schedules_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Входящий звонок: в отличие от handle_callback, тут нет make_call() —
+    состояние создаётся сразу, обработка звонка запускается в фоне."""
+    from phoneagent.config import get_settings
+    from phoneagent.connectors.mock import MockBookingConnector
+    from phoneagent.core.orchestrator import Orchestrator
+    from phoneagent.core.state_store import InMemoryStateStore
+    from phoneagent.models.conversation import ConversationStep
+    from phoneagent.providers.stt.mock import MockSTTProvider
+    from phoneagent.providers.telephony.mock import MockTelephonyProvider
+    from phoneagent.providers.tts.mock import MockTTSProvider
+
+    for key in ("TELEPHONY_PROVIDER", "STT_PROVIDER", "TTS_PROVIDER", "LLM_PROVIDER", "BOOKING_CONNECTOR"):
+        monkeypatch.setenv(key, "mock")
+    monkeypatch.setenv("STATE_STORE", "memory")
+    get_settings.cache_clear()
+
+    orchestrator = Orchestrator(
+        telephony=MockTelephonyProvider(),
+        stt=MockSTTProvider(),
+        tts=MockTTSProvider(),
+        llm=MockLLMAgent(),
+        booking=MockBookingConnector(),
+        state_store=InMemoryStateStore(),
+    )
+
+    await orchestrator.handle_inbound_call("inbound-1", "demo", "+79990001122")
+
+    state = await orchestrator.state_store.get("inbound-1")
+    assert state is not None
+    assert state.client_phone == "+79990001122"
+    assert state.step == ConversationStep.GREETING
+    assert len(orchestrator._background_tasks) == 1
+
+    # Не ждём полного диалога (mock STT уходит в несколько retry-циклов по
+    # 0.5s) — достаточно знать, что обработка реально запущена в фоне.
+    for task in list(orchestrator._background_tasks):
+        task.cancel()
+    get_settings.cache_clear()

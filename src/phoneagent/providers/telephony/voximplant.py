@@ -35,6 +35,7 @@ from typing import Any
 import httpx
 
 from phoneagent.config import get_settings
+from phoneagent.core.audio_session import get_session, wait_for_session
 from phoneagent.models.call import CallEvent, CallRef, CallStatus, CallStatusEnum
 from phoneagent.providers.telephony.base import BaseTelephonyProvider
 from phoneagent.utils import get_logger, mask_phone
@@ -54,6 +55,10 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
     """Провайдер телефонии Voximplant."""
 
     name = "voximplant"
+    # Phase B: send_audio реально доставляет звук (через AudioSession + мост
+    # api/media_ws.py) — Orchestrator.handle_callback больше не отказывает
+    # в реальном звонке для этого провайдера.
+    supports_realtime_audio = True
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -123,22 +128,35 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
         return ref
 
     async def hangup(self, call_id: str) -> None:
-        """Останавливает сессию через её `media_session_access_secure_url`.
+        """Останавливает звонок.
 
+        Для исходящих (StartScenarios) — через `media_session_access_secure_url`.
         Реального REST-метода `StopCall` не существует: единственный способ
         достучаться до запущенного сценария извне — HTTP-запрос на этот URL,
         который в сценарии приходит как `AppEvents.HttpRequest` (сценарий
         должен сам на него повесить `call.hangup()`, см. voxengine/*.js).
+
+        Для входящих такого URL нет вообще (сценарий не запускался через
+        StartScenarios) — единственный канал наружу к сценарию это сам
+        WS-мост, поэтому просим AudioSession подать сигнал (см. её
+        hangup_requested) — мост сам закроет соединение, а обработчик
+        WebSocketEvents.CLOSE в inbound-сценарии вызовет call.hangup().
         """
         session = self._sessions.pop(call_id, None)
-        if session is None:
+        if session is not None:
+            if self._client is None:
+                msg = "Voximplant client not connected"
+                raise RuntimeError(msg)
+            await self._client.get(session.media_session_access_secure_url)
+            logger.info("voximplant_call_hangup", call_id=call_id)
+            return
+
+        audio_session = get_session(call_id)
+        if audio_session is None:
             logger.warning("voximplant_hangup_unknown_call", call_id=call_id)
             return
-        if self._client is None:
-            msg = "Voximplant client not connected"
-            raise RuntimeError(msg)
-        await self._client.get(session.media_session_access_secure_url)
-        logger.info("voximplant_call_hangup", call_id=call_id)
+        audio_session.request_hangup()
+        logger.info("voximplant_call_hangup_requested_inbound", call_id=call_id)
 
     async def get_status(self, call_id: str) -> CallStatus:
         """Получает статус через GetCallHistory (пока упрощённо)."""
@@ -168,14 +186,26 @@ class VoximplantTelephonyProvider(BaseTelephonyProvider):
             yield
 
     async def send_audio(self, call_id: str, audio: AsyncIterator[bytes]) -> None:
-        """Аудио идёт через мост `/ws/voxengine/{call_id}` (Phase B), не отсюда.
+        """Кладёт чанки TTS в AudioSession.outgoing — реально их отправляет
+        мост `api/media_ws.py` (там же реальный тайминг, см. paced_frames).
 
-        См. docs/superpowers/specs/2026-09-09-voximplant-audio-bridge-design.md —
-        открытый вопрос №3: остаётся ли `_say()`/`send_audio` единым путём
-        вывода звука, или мост пишет в WS напрямую. Пока не Phase B — не реализовано.
+        Ждёт до `wait_for_session`-таймаута, если мост ещё не успел
+        подключиться (гонка: make_call() уже вернулся, а VoxEngine откроет
+        WS только после CallEvents.Connected — на секунду-другую позже).
+
+        Возвращается только когда мост реально забрал все чанки из очереди
+        (см. wait_drained) — не когда они просто положены туда. Orchestrator
+        полагается на это: _say() не должен считаться завершённым, пока
+        агент физически не договорил, иначе _listen() начнёт слушать поверх
+        ещё звучащей на линии речи агента.
         """
-        msg = "send_audio: реализуется в Phase B аудио-моста (см. spec)"
-        raise NotImplementedError(msg)
+        session = await wait_for_session(call_id)
+        if session is None:
+            logger.warning("voximplant_send_audio_no_session", call_id=call_id)
+            return
+        async for chunk in audio:
+            session.push_outgoing(chunk)
+        await session.wait_drained()
 
     async def send_text(self, call_id: str, text: str) -> None:
         """Не используется — TTS всегда наш пайплайн, не встроенный SpeechKit."""

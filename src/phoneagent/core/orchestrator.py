@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import audioop
+import random
 import uuid
 from datetime import date, datetime
 from typing import Any
@@ -15,7 +17,14 @@ import structlog
 from phoneagent.config import get_settings
 from phoneagent.connectors.base import BaseBookingConnector
 from phoneagent.connectors.factory import build_booking_connector
-from phoneagent.core.agent import TOOL_DESCRIPTIONS, BaseLLMAgent, ToolExecutor, build_llm_agent
+from phoneagent.core.agent import (
+    TOOL_DESCRIPTIONS,
+    AgentResponse,
+    BaseLLMAgent,
+    ToolExecutor,
+    build_llm_agent,
+)
+from phoneagent.core.audio_session import AudioSession, get_session
 from phoneagent.core.state_store import BaseStateStore, build_state_store
 from phoneagent.models.booking import BookingRequest
 from phoneagent.models.conversation import (
@@ -37,6 +46,14 @@ from phoneagent.utils import get_logger, mask_phone
 logger = get_logger(__name__)
 
 TERMINAL_STEPS = (ConversationStep.END, ConversationStep.ESCALATE)
+
+# Филлер-фразы на случай, если LLM отвечает дольше llm_soft_timeout_seconds —
+# тишина в трубке дольше пары секунд ощущается как оборвавшийся звонок.
+FILLER_PHRASES = (
+    "Секунду, уточняю...",
+    "Одну минуту, смотрю...",
+    "Сейчас проверю...",
+)
 
 
 class DuplicateCallbackError(Exception):
@@ -153,6 +170,39 @@ class Orchestrator:
 
         return call_ref.call_id
 
+    async def handle_inbound_call(
+        self,
+        call_id: str,
+        salon_id: str,
+        client_phone: str,
+        *,
+        language: str | None = None,
+    ) -> None:
+        """Точка входа для ВХОДЯЩЕГО звонка: клиент дозвонился сам.
+
+        В отличие от handle_callback — телефония уже держит живой звонок
+        (мост уже подключён, AudioSession уже создана в media_ws.py/
+        audiosocket_server.py до вызова этого метода), поэтому тут нет ни
+        make_call(), ни dedupe-лока, ни проверки supports_realtime_audio.
+        Вызывается мостом на событии "start", когда для call_id ещё нет
+        состояния в state_store (см. api/media_ws.py).
+        """
+        language = language or self.settings.default_language
+
+        state = ConversationState(
+            call_id=call_id,
+            salon_id=salon_id,
+            client_phone=client_phone,
+            language=language,
+            step=ConversationStep.GREETING,
+        )
+        await self._save(state)
+        logger.info("inbound_call_started", call_id=call_id, phone=mask_phone(client_phone))
+
+        task = asyncio.create_task(self._process_call(call_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def handle_text_message(
         self,
         *,
@@ -191,12 +241,37 @@ class Orchestrator:
 
         return {"call_id": call_id, "reply": response.text, "step": state.step.value}
 
-    async def _run_turn(self, state: ConversationState, user_text: str) -> Any:
-        """Один turn: реплика клиента → LLM (+tools) → текст ответа. Двигает FSM."""
+    async def _run_turn(self, state: ConversationState, user_text: str) -> AgentResponse:
+        """Один turn: реплика клиента → LLM (+tools) → текст ответа. Двигает FSM.
+
+        Мягкий таймаут (llm_soft_timeout_seconds): если модель молчит дольше
+        — говорим филлер-фразу и продолжаем ждать настоящий ответ тем же
+        запросом (asyncio.shield — не отменяем его). Любая ошибка LLM
+        (быстрый сбой API или обрыв уже после филлера) — не роняем звонок
+        молча, а вежливо прощаемся и завершаем разговор.
+        """
         state.messages.append(Message(role=Role.USER, content=user_text))
-        response = await self.llm.run_turn(
-            state, user_text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state)
+        llm_task = asyncio.create_task(
+            self.llm.run_turn(
+                state, user_text, TOOL_DESCRIPTIONS, execute_tool=self._tool_executor(state)
+            )
         )
+        try:
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.shield(llm_task), timeout=self.settings.llm_soft_timeout_seconds
+                )
+            except TimeoutError:
+                await self._say_safe(state, random.choice(FILLER_PHRASES))
+                response = await llm_task
+        except Exception:
+            logger.exception("llm_turn_failed")
+            state.step = ConversationStep.END
+            await self._say_safe(
+                state, "Извините, у меня технические неполадки. Пожалуйста, перезвоните позже."
+            )
+            return AgentResponse(text="", is_final=True)
+
         if response.text:
             state.messages.append(Message(role=Role.ASSISTANT, content=response.text))
         if response.is_final and state.step == ConversationStep.CONFIRMATION:
@@ -261,19 +336,78 @@ class Orchestrator:
         В mock-режиме — здесь нет реального аудио-стрима, поэтому voice-цикл
         для mock-телефонии не ведёт содержательный диалог (используйте
         /call/text для полноценного текстового прогона FSM).
-        В реальном режиме — стримит аудио из telephony в STT (ждёт реализации
-        провайдер-специфичного WebSocket/Media Streams моста).
+
+        В реальном режиме (Phase B) — копит аудио из AudioSession, пока
+        клиент говорит, до паузы (см. `_collect_utterance`), и отдаёт
+        накопленное в STT целиком. Половина reply, играющая одновременно с
+        речью клиента (barge-in), не поддерживается: _dialog_loop строго
+        turn-based — _say() всегда полностью доигрывает до начала _listen().
         """
         if self.stt.name == "mock":
             await asyncio.sleep(0.5)
             return ""
 
-        # Заглушка: в реальной реализации — чтение из очереди событий
-        # и стриминг аудио в STT
-        return ""
+        session = get_session(state.call_id)
+        if session is None:
+            logger.warning("listen_no_audio_session", call_id=state.call_id)
+            return ""
+
+        audio = await self._collect_utterance(session)
+        if not audio:
+            return ""
+
+        return await self.stt.transcribe(
+            audio, language=state.language, sample_rate=self.settings.sample_rate
+        )
+
+    async def _collect_utterance(self, session: AudioSession) -> bytes:
+        """Простой energy-based VAD: копит входящее аудио, пока RMS-амплитуда
+        выше порога, до тишины нужной длины после начала речи (см. настройки
+        vad_* в config.py — там же обоснование и upgrade-путь).
+        """
+        settings = self.settings
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        last_speech_time = start_time
+        speech_started = False
+        buffer = bytearray()
+
+        while True:
+            now = loop.time()
+            if now - start_time >= settings.vad_max_utterance_seconds:
+                break
+            if speech_started:
+                timeout = settings.vad_silence_seconds - (now - last_speech_time)
+            else:
+                timeout = settings.vad_initial_silence_seconds - (now - start_time)
+            if timeout <= 0:
+                break
+
+            try:
+                async with asyncio.timeout(timeout):
+                    chunk = await session.incoming.get()
+            except TimeoutError:
+                break
+            if chunk is None:  # сессия закрылась (звонок оборвался посреди реплики)
+                break
+
+            buffer.extend(chunk)
+            if audioop.rms(chunk, 2) > settings.vad_energy_threshold:
+                speech_started = True
+                last_speech_time = loop.time()
+
+        return bytes(buffer) if speech_started else b""
 
     async def _say(self, state: ConversationState, text: str) -> None:
-        """Синтезирует речь и отправляет клиенту."""
+        """Синтезирует речь и отправляет клиенту.
+
+        Echo guard: send_audio() уже не возвращается, пока мост реально не
+        заберёт всё аудио на отправку (см. AudioSession.wait_drained), но
+        короткий хвост эха/реверберации ещё может звучать на линии секунду
+        после этого. Дополнительная пауза (echo_guard_seconds) перед тем,
+        как _listen() начнёт слушать, снижает шанс, что VAD примет этот
+        хвост собственного голоса агента за реплику клиента.
+        """
         logger.debug("agent_says", text=text)
 
         async def audio_stream() -> Any:
@@ -283,6 +417,7 @@ class Orchestrator:
                 yield chunk
 
         await self.telephony.send_audio(state.call_id, audio_stream())
+        await asyncio.sleep(self.settings.echo_guard_seconds)
         try:
             await self.telephony.send_text(state.call_id, text)
         except NotImplementedError:
