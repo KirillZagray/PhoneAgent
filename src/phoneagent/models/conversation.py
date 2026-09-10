@@ -52,6 +52,11 @@ class ConversationState(BaseModel):
     salon_id: str
     client_phone: str
     language: str = "ru"
+    # Если задано — звонок не заводит обычный FSM записи на услугу, а просто
+    # проговаривает этот текст и завершается (см. Orchestrator._dialog_loop).
+    # Нужно для разовых уведомлений ("готово", "перенесли встречу"), а не
+    # только для диалога салона.
+    announcement: str | None = None
 
     # FSM
     step: ConversationStep = ConversationStep.GREETING

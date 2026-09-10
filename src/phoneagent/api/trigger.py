@@ -53,6 +53,7 @@ async def request_callback(req: CallbackRequest, request: Request) -> CallbackRe
             client_phone=req.phone,
             salon_id=req.salon_id,
             language=req.language,
+            announcement=req.extra.get("initial_message") or None,
         )
         logger.info("callback_requested", call_id=call_id, phone=mask_phone(req.phone))
         return CallbackResponse(call_id=call_id)

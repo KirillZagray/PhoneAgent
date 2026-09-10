@@ -124,8 +124,13 @@ class Orchestrator:
         salon_id: str,
         *,
         language: str | None = None,
+        announcement: str | None = None,
     ) -> str:
         """Точка входа: клиент нажал "Перезвонить" → инициируем звонок.
+
+        announcement: если задано — это не запись на услугу, а разовое
+        голосовое уведомление (см. ConversationState.announcement и
+        _dialog_loop) — звонок проговаривает текст и сразу завершается.
 
         Returns:
             call_id
@@ -161,6 +166,7 @@ class Orchestrator:
             client_phone=client_phone,
             language=language,
             step=ConversationStep.GREETING,
+            announcement=announcement,
         )
         await self._save(state)
 
@@ -304,6 +310,13 @@ class Orchestrator:
                 logger.info("call_completed", step=state.step.value)
 
     async def _dialog_loop(self, state: ConversationState) -> None:
+        if state.announcement:
+            # Разовое уведомление — не заводим FSM записи на услугу, просто
+            # проговариваем текст и вешаем трубку (hangup — в _process_call).
+            await self._say(state, state.announcement)
+            state.step = ConversationStep.END
+            return
+
         await self._say(
             state,
             f"Здравствуйте! Это {self.settings.salon_name}. Я AI-ассистент, помогу записаться на услугу.",
