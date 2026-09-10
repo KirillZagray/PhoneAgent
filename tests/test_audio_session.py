@@ -174,3 +174,47 @@ async def test_paced_frames_empty_session_yields_nothing() -> None:
         assert frames == []
     finally:
         remove_session("call-f")
+
+
+@pytest.mark.asyncio
+async def test_paced_frames_sends_keepalive_silence_when_idle() -> None:
+    """Asterisk AudioSocket рвёт канал после 2000ms без активности на
+    сокете (см. audiosocket_server.AUDIOSOCKET_IDLE_KEEPALIVE_MS) — при
+    простое (клиент молчит, нам нечего сказать) paced_frames должен сам
+    подавать тишину с интервалом idle_keepalive_ms, а не просто висеть."""
+    session = create_session("call-keepalive-1")
+    try:
+        gen = paced_frames(session, frame_ms=20, sample_rate=8000, idle_keepalive_ms=30)
+        frame1 = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        frame2 = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert frame1 == b"\x00" * 320
+        assert frame2 == b"\x00" * 320
+    finally:
+        remove_session("call-keepalive-1")
+
+
+@pytest.mark.asyncio
+async def test_paced_frames_real_audio_preempts_keepalive() -> None:
+    session = create_session("call-keepalive-2")
+    try:
+        gen = paced_frames(session, frame_ms=20, sample_rate=8000, idle_keepalive_ms=500)
+        session.push_outgoing(b"\x07" * 320)
+        # Реальные данные пришли задолго до keepalive-интервала — должны
+        # выйти как есть, не подмениться тишиной.
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=0.2)
+        assert frame == b"\x07" * 320
+    finally:
+        remove_session("call-keepalive-2")
+
+
+@pytest.mark.asyncio
+async def test_paced_frames_without_keepalive_blocks_indefinitely_on_idle() -> None:
+    """Без idle_keepalive_ms (Voximplant-путь) поведение не меняется —
+    просто висим на пустой очереди, тишину сами не изобретаем."""
+    session = create_session("call-keepalive-3")
+    try:
+        gen = paced_frames(session, frame_ms=20, sample_rate=8000)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(gen.__anext__(), timeout=0.1)
+    finally:
+        remove_session("call-keepalive-3")

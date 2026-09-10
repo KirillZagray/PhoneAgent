@@ -41,6 +41,14 @@ KIND_ERROR = 0xFF
 
 _HEADER_SIZE = 3  # 1 байт type + 2 байта length
 
+# Asterisk-овский app_audiosocket.c рвёт канал после 2000ms без активности
+# на TCP-сокете — жёстко зашито в C, дialplan-аргумента под это нет (см.
+# MAX_WAIT_TIMEOUT_MSEC в исходниках). На реальной линии с подавлением
+# тишины у оператора это реально происходит: пока клиент молчит, к нам не
+# приходит вообще ничего, и если мы тоже молчим — канал рвётся посреди
+# разговора. 800ms — запас почти в 2.5 раза от лимита.
+AUDIOSOCKET_IDLE_KEEPALIVE_MS = 800
+
 
 async def _read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes] | None:
     """Читает один AudioSocket-фрейм. None — соединение закрыто (EOF)."""
@@ -64,7 +72,10 @@ async def _send_outgoing_audio(writer: asyncio.StreamWriter, session: AudioSessi
     settings = get_settings()
     try:
         async for frame in paced_frames(
-            session, frame_ms=settings.audio_frame_ms, sample_rate=settings.sample_rate
+            session,
+            frame_ms=settings.audio_frame_ms,
+            sample_rate=settings.sample_rate,
+            idle_keepalive_ms=AUDIOSOCKET_IDLE_KEEPALIVE_MS,
         ):
             _write_frame(writer, KIND_AUDIO, frame)
             await writer.drain()

@@ -415,7 +415,9 @@ class OpenAILLMAgent(BaseLLMAgent):
                 model=self.settings.openai_model,
                 messages=messages,
                 tools=openai_tools,
-                max_tokens=512,
+                # Не max_tokens — новые модели (gpt-5.x и т.п.) отклоняют этот
+                # параметр как unsupported_parameter, ждут max_completion_tokens.
+                max_completion_tokens=512,
             )
             msg_response = response.choices[0].message
             text = msg_response.content or ""

@@ -74,6 +74,24 @@ class AudioSession:
         """
         await self._drained.wait()
 
+    def clear_outgoing(self) -> None:
+        """Барж-ин: обрывает ещё не отправленные исходящие чанки — агент
+        "замолкает" немедленно, не дожидаясь конца фразы.
+
+        Не идеально атомарно: мост может как раз в этот момент вычитывать
+        последний чанк через paced_frames() (гонка двух consumer'ов одной
+        очереди) — в худшем случае в линию улетит ещё до одного
+        недоотправленного кадра (~20ms), это не критично для цели barge-in.
+        """
+        try:
+            while True:
+                self.outgoing.get_nowait()
+                self._pending_out = max(0, self._pending_out - 1)
+        except asyncio.QueueEmpty:
+            pass
+        if self._pending_out == 0:
+            self._drained.set()
+
     def request_hangup(self) -> None:
         self.hangup_requested.set()
 
@@ -126,7 +144,11 @@ async def wait_for_session(
 
 
 async def paced_frames(
-    session: AudioSession, *, frame_ms: int, sample_rate: int
+    session: AudioSession,
+    *,
+    frame_ms: int,
+    sample_rate: int,
+    idle_keepalive_ms: int | None = None,
 ) -> AsyncIterator[bytes]:
     """Читает `session.outgoing` и отдаёт кадры фиксированного размера с
     реальным таймингом (по `frame_ms` между кадрами) — то, что телефония
@@ -136,15 +158,35 @@ async def paced_frames(
     поэтому копим в буфере и режем ровно по frame_bytes. Последний неполный
     кадр при закрытии сессии — добиваем тишиной, а не отбрасываем (короткий
     хвост фразы всё равно должен дойти до собеседника).
+
+    idle_keepalive_ms: если очередь пуста дольше этого времени — отдаём
+    один кадр тишины и ждём дальше, вместо того чтобы просто висеть на
+    get(). Нужен для Asterisk AudioSocket: у него зашитый (не настраиваемый)
+    таймаут 2000ms "нет активности на сокете" — при тишине на линии
+    (подавление тишины у оператора, никакого реального аудио не летит)
+    он рвёт канал, если мы тоже ничего не шлём. У Voximplant такой проблемы
+    не замечено — параметр не передаётся, поведение не меняется.
     """
     frame_bytes = int(sample_rate * frame_ms / 1000) * 2  # PCM16 mono = 2 байта/сэмпл
     frame_seconds = frame_ms / 1000
+    keepalive_seconds = idle_keepalive_ms / 1000 if idle_keepalive_ms is not None else None
     buffer = bytearray()
     loop = asyncio.get_event_loop()
     next_send_at: float | None = None
 
     while True:
-        chunk = await session.outgoing.get()
+        try:
+            chunk = await asyncio.wait_for(session.outgoing.get(), timeout=keepalive_seconds)
+        except TimeoutError:
+            # Очередь пуста дольше keepalive-интервала — шлём тишину, не
+            # трогая буфер темпирования (в нём и так тишина/нечего слать).
+            now = loop.time()
+            if next_send_at is not None and next_send_at > now:
+                await asyncio.sleep(next_send_at - now)
+            next_send_at = max(now, next_send_at or now) + frame_seconds
+            yield b"\x00" * frame_bytes
+            continue
+
         if chunk is None:
             break
         session.mark_outgoing_taken()

@@ -39,6 +39,7 @@ services:
       - ./asterisk_conf/extensions.conf:/etc/asterisk/extensions.conf:ro
       - ./asterisk_conf/ari.conf:/etc/asterisk/ari.conf:ro
       - ./asterisk_conf/http.conf:/etc/asterisk/http.conf:ro
+      - ./asterisk_conf/rtp.conf:/etc/asterisk/rtp.conf:ro
     ports:
       # SIP-сигналинг и RTP наружу — транк регистрируется исходящим REGISTER,
       # но ответный трафик (и будущие входящие) должны достучаться до нас.

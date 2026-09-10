@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import contextlib
 import random
 import uuid
 from datetime import date, datetime
@@ -339,9 +340,8 @@ class Orchestrator:
 
         В реальном режиме (Phase B) — копит аудио из AudioSession, пока
         клиент говорит, до паузы (см. `_collect_utterance`), и отдаёт
-        накопленное в STT целиком. Половина reply, играющая одновременно с
-        речью клиента (barge-in), не поддерживается: _dialog_loop строго
-        turn-based — _say() всегда полностью доигрывает до начала _listen().
+        накопленное в STT целиком. Барж-ин (клиент перебивает ещё
+        говорящего агента) обрабатывается внутри _say() — см. там.
         """
         if self.stt.name == "mock":
             await asyncio.sleep(0.5)
@@ -401,12 +401,23 @@ class Orchestrator:
     async def _say(self, state: ConversationState, text: str) -> None:
         """Синтезирует речь и отправляет клиенту.
 
-        Echo guard: send_audio() уже не возвращается, пока мост реально не
-        заберёт всё аудио на отправку (см. AudioSession.wait_drained), но
-        короткий хвост эха/реверберации ещё может звучать на линии секунду
-        после этого. Дополнительная пауза (echo_guard_seconds) перед тем,
-        как _listen() начнёт слушать, снижает шанс, что VAD примет этот
-        хвост собственного голоса агента за реплику клиента.
+        Барж-ин: пока TTS играет, параллельно слушаем входящее аудио этой
+        сессии (_wait_for_barge_in). Если клиент начал устойчиво говорить
+        поверх агента — агент обрывает фразу (session.clear_outgoing +
+        отмена send_audio) вместо того, чтобы доболтать до конца поверх
+        собеседника (см. разбор реальной записи звонка 2026-09-10, где
+        агент дважды продолжал говорить, пока клиент договаривал/повторял
+        свою реплику). Всё, что успели вычитать из session.incoming за
+        время речи агента, возвращаем обратно в очередь в конце — иначе
+        речь клиента параллельно с агентом (даже не переросшая в барж-ин)
+        молча терялась бы вместо того, чтобы достаться следующему _listen().
+
+        Echo guard: если барж-ина не было, send_audio() не возвращается,
+        пока мост реально не заберёт всё аудио на отправку (см.
+        AudioSession.wait_drained), но короткий хвост эха/реверберации ещё
+        может звучать на линии секунду после этого. Дополнительная пауза
+        (echo_guard_seconds) перед тем, как _listen() начнёт слушать,
+        снижает шанс, что VAD примет этот хвост за реплику клиента.
         """
         logger.debug("agent_says", text=text)
 
@@ -416,12 +427,67 @@ class Orchestrator:
             ):
                 yield chunk
 
-        await self.telephony.send_audio(state.call_id, audio_stream())
+        session = get_session(state.call_id)
+        send_task = asyncio.create_task(self.telephony.send_audio(state.call_id, audio_stream()))
+
+        if session is not None:
+            collected: list[bytes] = []
+            barge_in_task = asyncio.create_task(self._wait_for_barge_in(session, collected))
+            done, _pending = await asyncio.wait(
+                {send_task, barge_in_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            barged_in = barge_in_task in done and not send_task.done() and barge_in_task.result()
+            if not barge_in_task.done():
+                barge_in_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await barge_in_task
+            for chunk in collected:
+                session.push_incoming(chunk)
+            if barged_in:
+                logger.info("barge_in_detected", call_id=state.call_id)
+                session.clear_outgoing()
+                send_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await send_task
+                return
+            await send_task
+        else:
+            await send_task
+
         await asyncio.sleep(self.settings.echo_guard_seconds)
         try:
             await self.telephony.send_text(state.call_id, text)
         except NotImplementedError:
             pass
+
+    async def _wait_for_barge_in(self, session: AudioSession, collected: list[bytes]) -> bool:
+        """Слушает session.incoming, пока говорит агент. Каждый прочитанный
+        чанк складывает в `collected` (общий буфер с вызывающим _say) —
+        чтобы вызывающий код мог вернуть их в очередь, если барж-ин не
+        подтвердится (или таск отменят раньше).
+
+        Игнорирует первые barge_in_grace_seconds (хвост собственного эха
+        сразу после начала фразы) и требует barge_in_confirm_chunks подряд
+        идущих громких чанков — без этого один случайный щелчок/эхо-всплеск
+        обрывал бы агента на ровном месте.
+        """
+        settings = self.settings
+        loop = asyncio.get_event_loop()
+        started_at = loop.time()
+        consecutive = 0
+        while True:
+            chunk = await session.incoming.get()
+            if chunk is None:
+                return False
+            collected.append(chunk)
+            if loop.time() - started_at < settings.barge_in_grace_seconds:
+                continue
+            if audioop.rms(chunk, 2) > settings.vad_energy_threshold:
+                consecutive += 1
+                if consecutive >= settings.barge_in_confirm_chunks:
+                    return True
+            else:
+                consecutive = 0
 
     async def _say_safe(self, state: ConversationState, text: str) -> None:
         try:
