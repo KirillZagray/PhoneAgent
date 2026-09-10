@@ -16,6 +16,7 @@ RUN uv sync --frozen --no-cache --no-install-project
 
 # Copy source
 COPY src/ ./src/
+COPY README.md ./
 RUN uv sync --frozen --no-cache
 
 ENV PYTHONUNBUFFERED=1 \

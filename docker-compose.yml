@@ -30,6 +30,25 @@ services:
     networks:
       - phoneagent-net
 
+  asterisk:
+    image: andrius/asterisk:20
+    container_name: phoneagent-asterisk
+    restart: unless-stopped
+    volumes:
+      - ./asterisk_conf/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk_conf/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk_conf/ari.conf:/etc/asterisk/ari.conf:ro
+      - ./asterisk_conf/http.conf:/etc/asterisk/http.conf:ro
+    ports:
+      # SIP-сигналинг и RTP наружу — транк регистрируется исходящим REGISTER,
+      # но ответный трафик (и будущие входящие) должны достучаться до нас.
+      - "5060:5060/udp"
+      - "10000-10010:10000-10010/udp"
+    depends_on:
+      - phoneagent
+    networks:
+      - phoneagent-net
+
   redis:
     image: redis:7-alpine
     container_name: phoneagent-redis
